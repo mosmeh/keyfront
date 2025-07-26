@@ -1,0 +1,9 @@
+#!/bin/bash
+
+set -euo pipefail
+
+UTILS_DIR=$(dirname "$(readlink -f "$0")")
+
+cd "$UTILS_DIR/../valkey"
+
+./runtest --host 127.0.0.1 --cluster-mode --tags '-needs:repl -resp3' "$@"

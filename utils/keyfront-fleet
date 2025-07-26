@@ -1,0 +1,93 @@
+#!/bin/bash
+
+set -euo pipefail
+
+KEYFRONT_PATH="${KEYFRONT_PATH:-target/debug/}"
+VALKEY_PATH="${VALKEY_PATH:-}"
+NODES="${NODES:-3}"
+NUM="${NUM:-0}"
+BIND="${BIND:-127.0.0.1}"
+PORT="${PORT:-30000}"
+ARGS=()
+
+ENDNUM=$((NUM+NODES))
+ENDPORT=$((PORT+NODES))
+
+if [ -v 1 ]; then
+    if [ "$1" == "start" ]; then
+        cargo b
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            PORT=$((PORT+1))
+            NUM=$((NUM+1))
+            echo "Starting $PORT"
+            "$KEYFRONT_PATH"keyfront --bind "$BIND:$PORT" --backend "valkey-${NUM}.sock" --log-file "keyfront-${PORT}".log "${ARGS[@]}" &
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "stop" ]; then
+        while [ $((PORT < ENDPORT)) != "0" ]; do
+            PORT=$((PORT+1))
+            echo "Stopping $PORT"
+            "$VALKEY_PATH"valkey-cli -h "$BIND" -p $PORT shutdown nosave
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "restart" ]; then
+        cargo b
+        OLD_NUM=$NUM
+        OLD_PORT=$PORT
+        while [ $((PORT < ENDPORT)) != "0" ]; do
+            NUM=$((PORT+1))
+            PORT=$((PORT+1))
+            echo "Stopping $PORT"
+            "$VALKEY_PATH"valkey-cli -h "$BIND" -p $PORT shutdown nosave
+        done
+        NUM=$OLD_NUM
+        PORT=$OLD_PORT
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            PORT=$((PORT+1))
+            echo "Starting $PORT"
+            "$KEYFRONT_PATH"keyfront --bind "$BIND:$PORT" --backend "valkey-${NUM}.sock" --log-file "keyfront-${PORT}".log "${ARGS[@]}" &
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "tail" ]; then
+        INSTANCE=$2
+        NUM=$((NUM+INSTANCE))
+        tail -f "keyfront-${NUM}.log"
+        exit 0
+    fi
+
+    if [ "$1" == "tailall" ]; then
+        tail -f keyfront-*.log
+        exit 0
+    fi
+
+    if [ "$1" == "call" ]; then
+        shift
+        while [ $((PORT < ENDPORT)) != "0" ]; do
+            PORT=$((PORT+1))
+            "$VALKEY_PATH"valkey-cli -h "$BIND" -p $PORT "$@"
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "clean" ]; then
+        echo "Cleaning"
+        rm -rf keyfront-*.log
+        exit 0
+    fi
+fi
+
+echo "Usage: $0 [start|stop|restart|tail|tailall|clean|call]"
+echo "start       -- Launch instances."
+echo "stop        -- Stop instances."
+echo "restart     -- Restart instances."
+echo "tail <id>   -- Run tail -f of instance at base NUM + ID."
+echo "tailall     -- Run tail -f for all the log files at once."
+echo "clean       -- Remove all instances data, logs, configs."
+echo "call <cmd>  -- Call a command on all nodes."

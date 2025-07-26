@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -euo pipefail
+
+VALKEY_PATH="${VALKEY_PATH:-}"
+ARGS=(
+    --unixsocket valkey.sock
+    --port 0
+    --databases 16384
+    --save ''
+    --enable-protected-configs yes
+    --enable-debug-command yes
+    --enable-module-command yes
+)
+while [[ -v 1 ]]; do
+    case "$1" in
+    --cluster)
+        ARGS+=(
+            --cluster-enabled yes
+            --cluster-config-file "$(mktemp -p /tmp nodes.conf.XXXX)"
+            --cluster-require-full-coverage no
+        )
+        shift
+        ;;
+    *)
+        break
+        ;;
+    esac
+done
+ARGS+=("$@")
+
+"$VALKEY_PATH"valkey-server "${ARGS[@]}"

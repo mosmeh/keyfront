@@ -1,0 +1,3 @@
+[submodule "valkey"]
+	path = valkey
+	url = https://github.com/valkey-io/valkey.git

@@ -1,0 +1,415 @@
+mod backend;
+mod client;
+
+use crate::{backend::Backend, client::Client};
+use anyhow::ensure;
+use bstr::ByteSlice;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource};
+use keyfront::{
+    Address, NonZeroMemorySize,
+    cluster::{CLUSTER_SLOTS, Node},
+};
+use serde::Deserialize;
+use std::{
+    backtrace::Backtrace,
+    fs::OpenOptions,
+    net::SocketAddr,
+    num::{NonZeroU64, NonZeroUsize},
+    panic::PanicHookInfo,
+    path::PathBuf,
+    sync::{
+        Arc, RwLock,
+        atomic::{self, AtomicU64, AtomicUsize},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpSocket,
+    select,
+    signal::unix::{SignalKind, signal},
+    sync::{Semaphore, TryAcquireError},
+};
+use tokio_util::{
+    sync::{CancellationToken, WaitForCancellationFuture},
+    task::TaskTracker,
+};
+use tracing::{error, info, warn};
+
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+macro_rules! config {
+    ($(
+        $(#[$meta:meta])*
+        $field:ident: $ty:ty,
+    )*) => {
+        #[derive(Parser, Deserialize)]
+        #[clap(version)]
+        #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+        struct Config {
+            $(
+                $(#[$meta])*
+                #[clap(long)]
+                $field: $ty,
+            )*
+        }
+
+        impl Config {
+            fn merge(arg_matches: ArgMatches, config_from_args: Self, config_from_file: Self) -> Self {
+                Self {
+                    $(
+                        $field: if arg_matches
+                            .value_source(stringify!($field))
+                            .is_some_and(|s| s != ValueSource::DefaultValue)
+                        {
+                            config_from_args.$field
+                        } else {
+                            config_from_file.$field
+                        },
+                    )*
+                }
+            }
+        }
+    };
+}
+
+config! {
+    /// Listen for incoming connections on this IP address and port.
+    #[clap(default_value_t = defaults::bind())]
+    bind: SocketAddr,
+
+    /// TCP listen backlog.
+    #[clap(default_value_t = defaults::tcp_backlog())]
+    tcp_backlog: u32,
+
+    /// Equivalent to `maxclients` in Redis/Valkey.
+    #[clap(default_value_t = defaults::max_clients())]
+    max_clients: NonZeroUsize,
+
+    /// Equivalent to `proto-max-bulk-len` in Redis/Valkey.
+    #[clap(default_value_t = defaults::proto_max_bulk_len())]
+    proto_max_bulk_len: NonZeroMemorySize,
+
+    /// IP address and port to announce to clients and other nodes in the cluster.
+    ///
+    /// Defaults to the `bind` address if not specified.
+    announce: Option<SocketAddr>,
+
+    /// Address of the backend Redis/Valkey server.
+    /// This can be either an IP address and port, or a Unix socket path.
+    ///
+    /// If not specified, the server does not connect to any backend
+    /// and cannot perform any operations that require a backend.
+    backend: Option<Address>,
+
+    /// Timeout for the backend connection in milliseconds.
+    #[clap(default_value_t = defaults::backend_timeout())]
+    backend_timeout: NonZeroU64,
+
+    /// Interval in milliseconds to ping the backend server.
+    #[clap(default_value_t = defaults::ping_interval())]
+    ping_interval: NonZeroU64,
+
+    /// Number of worker threads.
+    #[clap(default_value_t = defaults::worker_threads())]
+    worker_threads: usize,
+
+    /// Path to the log file.
+    ///
+    /// If not specified, logs are written to stdout.
+    log_file: Option<PathBuf>,
+
+    /// Path to the configuration file.
+    ///
+    /// This file is in TOML format and provides default values for
+    /// the command line arguments.
+    /// Command line arguments will override values from this file.
+    config_file: Option<PathBuf>,
+}
+
+mod defaults {
+    use keyfront::NonZeroMemorySize;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        num::{NonZeroU64, NonZeroUsize},
+    };
+
+    pub fn bind() -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, 6379).into()
+    }
+
+    pub fn tcp_backlog() -> u32 {
+        511
+    }
+
+    pub fn max_clients() -> NonZeroUsize {
+        NonZeroUsize::new(10000).unwrap()
+    }
+
+    pub fn proto_max_bulk_len() -> NonZeroMemorySize {
+        NonZeroMemorySize::new(512 * 1024 * 1024).unwrap()
+    }
+
+    pub fn backend_timeout() -> NonZeroU64 {
+        NonZeroU64::new(10000).unwrap()
+    }
+
+    pub fn ping_interval() -> NonZeroU64 {
+        NonZeroU64::new(1000).unwrap()
+    }
+
+    pub fn worker_threads() -> usize {
+        0
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind: defaults::bind(),
+            tcp_backlog: defaults::tcp_backlog(),
+            max_clients: defaults::max_clients(),
+            proto_max_bulk_len: defaults::proto_max_bulk_len(),
+            announce: None,
+            backend: None,
+            backend_timeout: defaults::backend_timeout(),
+            ping_interval: defaults::ping_interval(),
+            worker_threads: defaults::worker_threads(),
+            log_file: None,
+            config_file: None,
+        }
+    }
+}
+
+impl Config {
+    fn backend_timeout(&self) -> Duration {
+        Duration::from_millis(self.backend_timeout.get())
+    }
+
+    fn ping_interval(&self) -> Duration {
+        Duration::from_millis(self.ping_interval.get())
+    }
+
+    fn load() -> anyhow::Result<Self> {
+        let arg_matches = Self::command().get_matches();
+        let config_from_args = match Self::from_arg_matches(&arg_matches) {
+            Ok(config) => config,
+            Err(e) => e.format(&mut Self::command()).exit(),
+        };
+        let config = if let Some(config_file) = &config_from_args.config_file {
+            let config_from_file: Self = toml::from_str(&std::fs::read_to_string(config_file)?)?;
+            ensure!(
+                config_from_file.config_file.is_none(),
+                "The configuration file cannot specify config-file",
+            );
+            Self::merge(arg_matches, config_from_args, config_from_file)
+        } else {
+            config_from_args
+        };
+        Ok(config)
+    }
+}
+
+fn panic_hook(info: &PanicHookInfo) {
+    let payload = info.payload();
+    let payload = if let Some(s) = payload.downcast_ref::<&str>() {
+        Some(*s)
+    } else {
+        payload.downcast_ref().map(String::as_str)
+    };
+
+    let location = info.location().map(ToString::to_string);
+    let backtrace = Backtrace::capture();
+
+    error!(
+        panic.payload = payload,
+        panic.location = location,
+        panic.backtrace = ?backtrace,
+        "A panic occurred",
+    );
+}
+
+fn main() -> anyhow::Result<()> {
+    let config = Config::load()?;
+
+    let subscriber = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing::Level::INFO.into())
+            .from_env()?,
+    );
+    if let Some(log_file) = &config.log_file {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)?;
+        subscriber.with_writer(file).with_ansi(false).init();
+        std::panic::set_hook(Box::new(panic_hook));
+    } else {
+        subscriber.init();
+    }
+
+    info!("Starting server");
+    let mut runtime = if config.worker_threads > 0 {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    if config.worker_threads > 0 {
+        runtime.worker_threads(config.worker_threads);
+    }
+    let result = runtime
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(Into::into)
+        .and_then(|runtime| runtime.block_on(run(config)));
+    match result {
+        Ok(()) => {}
+        Err(e) => error!("Server encountered an error: {:?}", e),
+    }
+    info!("Server stopped");
+
+    Ok(())
+}
+
+async fn run(config: Config) -> anyhow::Result<()> {
+    let tracker = TaskTracker::new();
+    let shutdown = Shutdown::default();
+    let result = Server::run(config, &tracker, shutdown.clone()).await;
+    info!("Shutting down server");
+    shutdown.request();
+    tracker.close();
+    tracker.wait().await;
+    result
+}
+
+struct Server {
+    config: Config,
+    backend: Option<Backend>,
+    slots: RwLock<Box<[Option<Node>; CLUSTER_SLOTS]>>,
+    this_node: Node,
+    next_client_id: AtomicU64,
+    clients_sem: Arc<Semaphore>,
+    stats: Statistics,
+    shutdown: Shutdown,
+}
+
+impl Server {
+    async fn run(config: Config, tracker: &TaskTracker, shutdown: Shutdown) -> anyhow::Result<()> {
+        {
+            let shutdown = shutdown.clone();
+            let mut sigint = signal(SignalKind::interrupt())?;
+            let mut sigterm = signal(SignalKind::terminate())?;
+            tokio::spawn(async move {
+                select! {
+                    _ = sigint.recv() => info!("Received SIGINT"),
+                    _ = sigterm.recv() => info!("Received SIGTERM"),
+                }
+                shutdown.request();
+            });
+        }
+
+        let backend = if let Some(addr) = &config.backend {
+            let backend = Backend::connect(addr, &config, tracker, shutdown.clone()).await?;
+            Some(backend)
+        } else {
+            info!("No backend specified");
+            None
+        };
+
+        let listener = match config.bind {
+            SocketAddr::V4(_) => TcpSocket::new_v4(),
+            SocketAddr::V6(_) => TcpSocket::new_v6(),
+        };
+        let listener = listener?;
+        listener.set_keepalive(true)?;
+        listener.set_reuseaddr(true)?;
+        listener.bind(config.bind)?;
+        let local_addr = listener.local_addr()?;
+
+        let slots = RwLock::new(
+            vec![None; CLUSTER_SLOTS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+        );
+        let node_name = Node::generate_random_name();
+        info!("My node name is {}", node_name.as_bstr());
+        let this_node = Node::new(node_name, config.announce.unwrap_or(local_addr));
+        let clients_sem = Arc::new(Semaphore::new(config.max_clients.get()));
+
+        let listener = listener.listen(config.tcp_backlog)?;
+        info!("Listening on {local_addr}");
+
+        let server = Arc::new(Self {
+            config,
+            backend,
+            slots,
+            this_node,
+            next_client_id: AtomicU64::new(1),
+            clients_sem: clients_sem.clone(),
+            stats: Statistics::default(),
+            shutdown: shutdown.clone(),
+        });
+
+        loop {
+            select! {
+                () = shutdown.requested() => break,
+                result = listener.accept() => {
+                    let mut frontend = match result {
+                        Ok((frontend, _)) => frontend,
+                        Err(e) => {
+                            warn!("Failed to accept connection: {e}");
+                            continue;
+                        },
+                    };
+                    let _ = frontend.set_nodelay(true);
+
+                    let permit = match clients_sem.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(TryAcquireError::Closed) => break,
+                        Err(TryAcquireError::NoPermits) => {
+                            let _ = frontend.write_all(b"-ERR max number of clients + cluster connections reached\r\n").await;
+                            server.stats.rejected_connections.fetch_add(1, atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+
+                    tracker.spawn({
+                        let server = server.clone();
+                        async move {
+                            let _permit = permit;
+                            Client::run(&server, frontend).await;
+                        }
+                    });
+
+                    server.stats.connections.fetch_add(1, atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        clients_sem.close();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Statistics {
+    connections: AtomicUsize,
+    rejected_connections: AtomicUsize,
+    commands: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+struct Shutdown(CancellationToken);
+
+impl Shutdown {
+    fn request(&self) {
+        self.0.cancel();
+    }
+
+    fn requested(&self) -> WaitForCancellationFuture<'_> {
+        self.0.cancelled()
+    }
+}

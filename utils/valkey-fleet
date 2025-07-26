@@ -1,0 +1,91 @@
+#!/bin/bash
+
+set -euo pipefail
+
+VALKEY_PATH="${VALKEY_PATH:-}"
+NODES="${NODES:-3}"
+NUM="${NUM:-0}"
+ARGS=(
+    --port 0
+    --databases 16384
+    --save ''
+    --daemonize yes
+    --enable-protected-configs yes
+    --enable-debug-command yes
+    --enable-module-command yes
+)
+
+ENDNUM=$((NUM+NODES))
+
+if [ -v 1 ]; then
+    if [ "$1" == "start" ]; then
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            echo "Starting $NUM"
+            "$VALKEY_PATH"valkey-server --unixsocket "valkey-${NUM}.sock" --logfile "valkey-${NUM}".log --pidfile "valkey-${NUM}.pid" "${ARGS[@]}"
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "stop" ]; then
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            echo "Stopping $NUM"
+            "$VALKEY_PATH"valkey-cli -s "valkey-${NUM}.sock" shutdown nosave
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "restart" ]; then
+        OLD_NUM=$NUM
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            echo "Stopping $NUM"
+            "$VALKEY_PATH"valkey-cli -s "valkey-${NUM}.sock" shutdown nosave
+        done
+        NUM=$OLD_NUM
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            echo "Starting $NUM"
+            "$VALKEY_PATH"valkey-server --unixsocket "valkey-${NUM}.sock" --logfile "valkey-${NUM}".log --pidfile "valkey-${NUM}.pid" "${ARGS[@]}"
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "tail" ]; then
+        INSTANCE=$2
+        NUM=$((NUM+INSTANCE))
+        tail -f "valkey-${NUM}.log"
+        exit 0
+    fi
+
+    if [ "$1" == "tailall" ]; then
+        tail -f valkey-*.log
+        exit 0
+    fi
+
+    if [ "$1" == "call" ]; then
+        shift
+        while [ $((NUM < ENDNUM)) != "0" ]; do
+            NUM=$((NUM+1))
+            "$VALKEY_PATH"valkey-cli -s "valkey-${NUM}.sock" "$@"
+        done
+        exit 0
+    fi
+
+    if [ "$1" == "clean" ]; then
+        echo "Cleaning"
+        rm -rf valkey-*.log
+        rm -rf valkey-*.pid
+        exit 0
+    fi
+fi
+
+echo "Usage: $0 [start|stop|restart|tail|tailall|clean|call]"
+echo "start       -- Launch Valkey instances."
+echo "stop        -- Stop Valkey instances."
+echo "restart     -- Restart Valkey instances."
+echo "tail <id>   -- Run tail -f of instance at base NUM + ID."
+echo "tailall     -- Run tail -f for all the log files at once."
+echo "clean       -- Remove all instances data, logs, configs."
+echo "call <cmd>  -- Call a command on all nodes."
