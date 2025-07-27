@@ -2,11 +2,13 @@ use crate::client::{Client, CommandError, ConnectionError};
 use bstr::ByteSlice;
 use bytes::BytesMut;
 use keyfront::{
-    ByteBuf, query,
+    ByteBuf,
+    net::Address,
+    query,
     reply::{InfoReply, KeyspaceStats},
     resp::WriteResp,
 };
-use std::sync::atomic;
+use std::{net::SocketAddr, sync::atomic};
 use tracing::{debug, info};
 
 #[expect(clippy::unnecessary_wraps)]
@@ -35,19 +37,33 @@ impl Client<'_> {
         let config = &self.server.config;
 
         if let Some(section) = info.section_mut(InfoReply::SERVER) {
-            section.replace("tcp_port", itoa_buf.format(config.bind.port()));
+            let mut tcp_addr = None;
+            let mut unix_addr = None;
+            for addr in &self.server.bound_addrs {
+                match addr {
+                    Address::Tcp(addr) if tcp_addr.is_none() => tcp_addr = Some(addr),
+                    Address::Unix(path) if unix_addr.is_none() => unix_addr = Some(path),
+                    _ => {}
+                }
+            }
+
+            section.replace(
+                "tcp_port",
+                itoa_buf.format(tcp_addr.map_or(0, SocketAddr::port)),
+            );
             section.replace("redis_mode", "cluster");
             section.replace("server_mode", "cluster");
 
             section.retain(|k, _| !k.starts_with(b"listener"));
-            section.insert(
-                "listener0",
-                format!(
-                    "name=tcp,bind={},port={}",
-                    config.bind.ip(),
-                    config.bind.port()
-                ),
-            );
+            if let Some(addr) = tcp_addr {
+                section.insert(
+                    "listener0",
+                    format!("name=tcp,bind={},port={}", addr.ip(), addr.port()),
+                );
+            }
+            if let Some(path) = unix_addr {
+                section.insert("listener1", format!("name=unix,bind={}", path.display()));
+            }
         }
 
         if let Some(section) = info.section_mut(InfoReply::CLIENTS) {

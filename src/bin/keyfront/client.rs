@@ -15,7 +15,10 @@ use keyfront::{
     resp::{ProtocolError, QueryDecoder, WriteResp},
 };
 use std::sync::atomic;
-use tokio::{io::AsyncWriteExt, net::TcpStream, select};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    select,
+};
 use tokio_util::codec::FramedRead;
 use tracing::error;
 
@@ -66,8 +69,11 @@ pub struct Client<'a> {
 }
 
 impl<'a> Client<'a> {
-    pub async fn run(server: &'a Server, stream: TcpStream) {
-        let (reader, mut writer) = stream.into_split();
+    pub async fn run<R, W>(server: &'a Server, reader: R, mut writer: W)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
         let decoder = QueryDecoder::new(server.config.proto_max_bulk_len);
         let mut stream = FramedRead::new(reader, decoder);
         let mut client = Self {

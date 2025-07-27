@@ -2,18 +2,19 @@ mod backend;
 mod client;
 
 use crate::{backend::Backend, client::Client};
-use anyhow::ensure;
+use anyhow::{bail, ensure};
 use bstr::ByteSlice;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use keyfront::{
-    Address, NonZeroMemorySize,
+    NonZeroMemorySize,
     cluster::{CLUSTER_SLOTS, Node},
+    net::{Address, Listener, ListenerKind, Socket},
 };
 use serde::Deserialize;
 use std::{
     backtrace::Backtrace,
     fs::OpenOptions,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     num::{NonZeroU64, NonZeroUsize},
     panic::PanicHookInfo,
     path::PathBuf,
@@ -25,7 +26,6 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    net::TcpSocket,
     select,
     signal::unix::{SignalKind, signal},
     sync::{Semaphore, TryAcquireError},
@@ -44,7 +44,7 @@ macro_rules! config {
         $(#[$meta:meta])*
         $field:ident: $ty:ty,
     )*) => {
-        #[derive(Parser, Deserialize)]
+        #[derive(Clone, Parser, Deserialize)]
         #[clap(version)]
         #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
         struct Config {
@@ -75,13 +75,14 @@ macro_rules! config {
 }
 
 config! {
-    /// Listen for incoming connections on this IP address and port.
-    #[clap(default_value_t = defaults::bind())]
-    bind: SocketAddr,
+    /// Listen for incoming connections on these addresses.
+    /// This can be either an IP address and port, or a Unix socket path.
+    #[clap(default_values_t = defaults::bind())]
+    bind: Vec<Address>,
 
-    /// TCP listen backlog.
-    #[clap(default_value_t = defaults::tcp_backlog())]
-    tcp_backlog: u32,
+    /// `listen()` backlog.
+    #[clap(default_value_t = defaults::backlog())]
+    backlog: u32,
 
     /// Equivalent to `maxclients` in Redis/Valkey.
     #[clap(default_value_t = defaults::max_clients())]
@@ -93,8 +94,11 @@ config! {
 
     /// IP address and port to announce to clients and other nodes in the cluster.
     ///
-    /// Defaults to the `bind` address if not specified.
+    /// Defaults to the first IP address and port in the `bind` list,
     announce: Option<SocketAddr>,
+
+    /// Run in single-node mode.
+    single_node: bool,
 
     /// Address of the backend Redis/Valkey server.
     /// This can be either an IP address and port, or a Unix socket path.
@@ -129,17 +133,17 @@ config! {
 }
 
 mod defaults {
-    use keyfront::NonZeroMemorySize;
+    use keyfront::{NonZeroMemorySize, net::Address};
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::Ipv4Addr,
         num::{NonZeroU64, NonZeroUsize},
     };
 
-    pub fn bind() -> SocketAddr {
-        (Ipv4Addr::LOCALHOST, 6379).into()
+    pub fn bind() -> Vec<Address> {
+        vec![Address::Tcp((Ipv4Addr::LOCALHOST, 6379).into())]
     }
 
-    pub fn tcp_backlog() -> u32 {
+    pub fn backlog() -> u32 {
         511
     }
 
@@ -168,10 +172,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: defaults::bind(),
-            tcp_backlog: defaults::tcp_backlog(),
+            backlog: defaults::backlog(),
             max_clients: defaults::max_clients(),
             proto_max_bulk_len: defaults::proto_max_bulk_len(),
             announce: None,
+            single_node: false,
             backend: None,
             backend_timeout: defaults::backend_timeout(),
             ping_interval: defaults::ping_interval(),
@@ -276,16 +281,32 @@ fn main() -> anyhow::Result<()> {
 async fn run(config: Config) -> anyhow::Result<()> {
     let tracker = TaskTracker::new();
     let shutdown = Shutdown::default();
-    let result = Server::run(config, &tracker, shutdown.clone()).await;
+    let result = Server::run(config.clone(), &tracker, shutdown.clone()).await;
     info!("Shutting down server");
     shutdown.request();
+
     tracker.close();
     tracker.wait().await;
+
+    for addr in &config.bind {
+        if let Address::Unix(path) = addr
+            && let Err(e) = std::fs::remove_file(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "Failed to remove Unix socket file '{}': {}",
+                path.display(),
+                e
+            );
+        }
+    }
+
     result
 }
 
 struct Server {
     config: Config,
+    bound_addrs: Vec<Address>,
     backend: Option<Backend>,
     slots: RwLock<Box<[Option<Node>; CLUSTER_SLOTS]>>,
     this_node: Node,
@@ -318,32 +339,54 @@ impl Server {
             None
         };
 
-        let listener = match config.bind {
-            SocketAddr::V4(_) => TcpSocket::new_v4(),
-            SocketAddr::V6(_) => TcpSocket::new_v6(),
-        };
-        let listener = listener?;
-        listener.set_keepalive(true)?;
-        listener.set_reuseaddr(true)?;
-        listener.bind(config.bind)?;
-        let local_addr = listener.local_addr()?;
+        let mut sockets = Vec::with_capacity(config.bind.len());
+        let mut bound_addrs = Vec::with_capacity(config.bind.len());
+        for bind in &config.bind {
+            let (socket, addr) = Socket::bind(bind.clone())?;
+            sockets.push(socket);
+            bound_addrs.push(addr);
+        }
 
+        let node_name = Node::generate_random_name();
+        info!("My node name is {}", node_name.as_bstr());
+
+        let announced_addr = if let Some(addr) = config.announce {
+            addr
+        } else if let Some(addr) = bound_addrs.iter().find_map(|addr| match addr {
+            Address::Tcp(addr) => Some(*addr),
+            Address::Unix(_) => None,
+        }) {
+            addr
+        } else if config.single_node {
+            // No one actually cares about this address, so just use a dummy address.
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            bail!("No TCP bind address specified, and no announce address provided");
+        };
+        let this_node = Node::new(node_name, announced_addr);
+
+        let assigned_node = config.single_node.then(|| {
+            info!("Running in single-node mode. All slots will be assigned to this node.");
+            this_node.clone()
+        });
         let slots = RwLock::new(
-            vec![None; CLUSTER_SLOTS]
+            vec![assigned_node; CLUSTER_SLOTS]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
         );
-        let node_name = Node::generate_random_name();
-        info!("My node name is {}", node_name.as_bstr());
-        let this_node = Node::new(node_name, config.announce.unwrap_or(local_addr));
+
         let clients_sem = Arc::new(Semaphore::new(config.max_clients.get()));
 
-        let listener = listener.listen(config.tcp_backlog)?;
-        info!("Listening on {local_addr}");
+        let mut listeners = Vec::with_capacity(sockets.len());
+        for (socket, addr) in sockets.into_iter().zip(bound_addrs.iter()) {
+            listeners.push(socket.listen(config.backlog)?);
+            info!("Listening on {addr}");
+        }
 
         let server = Arc::new(Self {
             config,
+            bound_addrs,
             backend,
             slots,
             this_node,
@@ -353,42 +396,20 @@ impl Server {
             shutdown: shutdown.clone(),
         });
 
-        loop {
-            select! {
-                () = shutdown.requested() => break,
-                result = listener.accept() => {
-                    let mut frontend = match result {
-                        Ok((frontend, _)) => frontend,
-                        Err(e) => {
-                            warn!("Failed to accept connection: {e}");
-                            continue;
-                        },
-                    };
-                    let _ = frontend.set_nodelay(true);
-
-                    let permit = match clients_sem.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(TryAcquireError::Closed) => break,
-                        Err(TryAcquireError::NoPermits) => {
-                            let _ = frontend.write_all(b"-ERR max number of clients + cluster connections reached\r\n").await;
-                            server.stats.rejected_connections.fetch_add(1, atomic::Ordering::Relaxed);
-                            continue;
-                        }
-                    };
-
-                    tracker.spawn({
-                        let server = server.clone();
-                        async move {
-                            let _permit = permit;
-                            Client::run(&server, frontend).await;
-                        }
-                    });
-
-                    server.stats.connections.fetch_add(1, atomic::Ordering::Relaxed);
+        for listener in listeners {
+            let server = server.clone();
+            let shutdown = shutdown.clone();
+            match listener {
+                ListenerKind::Tcp(listener) => {
+                    tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+                }
+                ListenerKind::Unix(listener) => {
+                    tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
                 }
             }
         }
 
+        shutdown.requested().await;
         clients_sem.close();
         Ok(())
     }
@@ -411,5 +432,47 @@ impl Shutdown {
 
     fn requested(&self) -> WaitForCancellationFuture<'_> {
         self.0.cancelled()
+    }
+}
+
+async fn run_accept_loop<T: Listener>(
+    mut listener: T,
+    server: Arc<Server>,
+    tracker: TaskTracker,
+    shutdown: Shutdown,
+) {
+    loop {
+        select! {
+            () = shutdown.requested() => break,
+            result = listener.accept() => {
+                let (reader, mut writer) = match result {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!("Failed to accept connection: {e}");
+                        continue;
+                    },
+                };
+
+                let permit = match server.clients_sem.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::Closed) => break,
+                    Err(TryAcquireError::NoPermits) => {
+                        let _ = writer.write_all(b"-ERR max number of clients + cluster connections reached\r\n").await;
+                        server.stats.rejected_connections.fetch_add(1, atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                tracker.spawn({
+                    let server = server.clone();
+                    async move {
+                        let _permit = permit;
+                        Client::run(&server, reader, writer).await;
+                    }
+                });
+
+                server.stats.connections.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+        }
     }
 }

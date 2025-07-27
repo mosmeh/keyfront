@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod commands;
+pub mod net;
 pub mod reply;
 pub mod resp;
 pub mod string;
@@ -12,48 +13,9 @@ pub use tokio_util;
 
 use serde::Deserialize;
 use std::{
-    convert::Infallible,
-    net::SocketAddr,
     num::{NonZeroUsize, ParseIntError},
-    path::PathBuf,
     str::FromStr,
 };
-
-#[derive(Debug, Clone)]
-pub enum Address {
-    Tcp(SocketAddr),
-    Unix(PathBuf),
-}
-
-impl std::fmt::Display for Address {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Self::Tcp(addr) => addr.fmt(f),
-            Self::Unix(path) => path.display().fmt(f),
-        }
-    }
-}
-
-impl FromStr for Address {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(if let Ok(addr) = s.parse() {
-            Self::Tcp(addr)
-        } else {
-            Self::Unix(s.into())
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for Address {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(String::deserialize(deserializer)?.parse().unwrap())
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct NonZeroMemorySize(NonZeroUsize);
