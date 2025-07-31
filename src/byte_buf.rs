@@ -22,6 +22,7 @@ mod repr {
 }
 
 use bstr::ByteSlice;
+use bytes::BytesMut;
 use repr::Repr;
 
 /// An owned, immutable sequence of bytes.
@@ -86,6 +87,12 @@ impl From<String> for ByteBuf {
 impl From<Box<str>> for ByteBuf {
     fn from(s: Box<str>) -> Self {
         Self(Repr::from_boxed_slice(s.into_boxed_bytes()))
+    }
+}
+
+impl From<BytesMut> for ByteBuf {
+    fn from(bytes: BytesMut) -> Self {
+        Self(Repr::from_boxed_slice(Vec::from(bytes).into_boxed_slice()))
     }
 }
 

@@ -1,7 +1,10 @@
 mod backend;
 mod client;
 
-use crate::{backend::Backend, client::Client};
+use crate::{
+    backend::{Backend, MemoryBackend, RedisBackend},
+    client::Client,
+};
 use anyhow::{bail, ensure};
 use bstr::ByteSlice;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource};
@@ -103,8 +106,7 @@ config! {
     /// Address of the backend Redis/Valkey server.
     /// This can be either an IP address and port, or a Unix socket path.
     ///
-    /// If not specified, the server does not connect to any backend
-    /// and cannot perform any operations that require a backend.
+    /// If not specified, the server will run with in-memory backend.
     backend: Option<Address>,
 
     /// Timeout for the backend connection in milliseconds.
@@ -279,12 +281,24 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    let tracker = TaskTracker::new();
     let shutdown = Shutdown::default();
-    let result = Server::run(config.clone(), &tracker, shutdown.clone()).await;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            select! {
+                _ = sigint.recv() => info!("Received SIGINT"),
+                _ = sigterm.recv() => info!("Received SIGTERM"),
+            }
+            shutdown.request();
+        }
+    });
+
+    let tracker = TaskTracker::new();
+    let result = run_server(config.clone(), &tracker, shutdown.clone()).await;
     info!("Shutting down server");
     shutdown.request();
-
     tracker.close();
     tracker.wait().await;
 
@@ -304,10 +318,26 @@ async fn run(config: Config) -> anyhow::Result<()> {
     result
 }
 
-struct Server {
+async fn run_server(
+    config: Config,
+    tracker: &TaskTracker,
+    shutdown: Shutdown,
+) -> anyhow::Result<()> {
+    if let Some(addr) = &config.backend {
+        info!("Initializing Redis backend");
+        let backend = RedisBackend::connect(addr, &config, tracker, shutdown.clone()).await?;
+        Server::run(config, backend, tracker, shutdown).await
+    } else {
+        info!("Initializing in-memory backend");
+        let backend = MemoryBackend::default();
+        Server::run(config, backend, tracker, shutdown).await
+    }
+}
+
+struct Server<B> {
     config: Config,
     bound_addrs: Vec<Address>,
-    backend: Option<Backend>,
+    backend: B,
     slots: RwLock<Box<[Option<Node>; CLUSTER_SLOTS]>>,
     this_node: Node,
     next_client_id: AtomicU64,
@@ -316,29 +346,13 @@ struct Server {
     shutdown: Shutdown,
 }
 
-impl Server {
-    async fn run(config: Config, tracker: &TaskTracker, shutdown: Shutdown) -> anyhow::Result<()> {
-        {
-            let shutdown = shutdown.clone();
-            let mut sigint = signal(SignalKind::interrupt())?;
-            let mut sigterm = signal(SignalKind::terminate())?;
-            tokio::spawn(async move {
-                select! {
-                    _ = sigint.recv() => info!("Received SIGINT"),
-                    _ = sigterm.recv() => info!("Received SIGTERM"),
-                }
-                shutdown.request();
-            });
-        }
-
-        let backend = if let Some(addr) = &config.backend {
-            let backend = Backend::connect(addr, &config, tracker, shutdown.clone()).await?;
-            Some(backend)
-        } else {
-            info!("No backend specified");
-            None
-        };
-
+impl<B: Backend> Server<B> {
+    async fn run(
+        config: Config,
+        backend: B,
+        tracker: &TaskTracker,
+        shutdown: Shutdown,
+    ) -> anyhow::Result<()> {
         let mut sockets = Vec::with_capacity(config.bind.len());
         let mut bound_addrs = Vec::with_capacity(config.bind.len());
         for bind in &config.bind {
@@ -369,12 +383,7 @@ impl Server {
             info!("Running in single-node mode. All slots will be assigned to this node.");
             this_node.clone()
         });
-        let slots = RwLock::new(
-            vec![assigned_node; CLUSTER_SLOTS]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-        );
+        let slots = RwLock::new(vec![assigned_node; CLUSTER_SLOTS].try_into().unwrap());
 
         let clients_sem = Arc::new(Semaphore::new(config.max_clients.get()));
 
@@ -435,12 +444,15 @@ impl Shutdown {
     }
 }
 
-async fn run_accept_loop<T: Listener>(
-    mut listener: T,
-    server: Arc<Server>,
+async fn run_accept_loop<L, B>(
+    mut listener: L,
+    server: Arc<Server<B>>,
     tracker: TaskTracker,
     shutdown: Shutdown,
-) {
+) where
+    L: Listener,
+    B: Backend,
+{
     loop {
         select! {
             () = shutdown.requested() => break,

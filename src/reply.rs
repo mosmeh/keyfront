@@ -1,13 +1,14 @@
-use crate::{ByteBuf, cluster::Slot, resp::ReadResp, string::parse_int};
+use crate::{ByteBuf, resp::ReadResp, string::parse_int};
 use bstr::ByteSlice;
 use bytes::{BufMut, BytesMut};
 use std::num::Saturating;
 
 const CRLF: &[u8] = b"\r\n";
 
-pub struct InfoReply(Vec<(ByteBuf, Section)>);
+#[derive(Default)]
+pub struct Info(Vec<(ByteBuf, Section)>);
 
-impl InfoReply {
+impl Info {
     pub const SERVER: &'static [u8] = b"server";
     pub const CLIENTS: &'static [u8] = b"clients";
     pub const STATS: &'static [u8] = b"stats";
@@ -68,6 +69,20 @@ impl InfoReply {
         self.0
             .iter_mut()
             .find_map(|(n, section)| n.eq_ignore_ascii_case(needle).then_some(section))
+    }
+
+    pub fn insert_section<T: AsRef<[u8]>>(&mut self, name: T) -> Option<Section> {
+        let needle = name.as_ref();
+        if let Some((_, section)) = self
+            .0
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(needle))
+        {
+            Some(std::mem::take(section))
+        } else {
+            self.0.push((needle.into(), Section::default()));
+            None
+        }
     }
 }
 
@@ -140,33 +155,21 @@ impl Section {
         self.0.retain(|(k, v)| f(k, v));
     }
 
-    pub fn to_database_stats(&self) -> impl Iterator<Item = (usize, KeyspaceStats)> {
-        self.0.iter().filter_map(|(key, value)| {
-            let db_id = parse_int(key.strip_prefix(b"db")?)?;
-            let mut parts = value.split_str(b",");
-            let keys = parts.next()?.strip_prefix(b"keys=")?;
-            let expires = parts.next()?.strip_prefix(b"expires=")?;
-            let avg_ttl = parts.next()?.strip_prefix(b"avg_ttl=")?;
-            if parts.next().is_some() {
-                return None;
-            }
-            Some((
-                db_id,
-                KeyspaceStats {
-                    keys: parse_int(keys)?,
-                    expires: parse_int(expires)?,
-                    avg_ttl: parse_int(avg_ttl)?,
-                },
-            ))
-        })
+    pub fn to_keyspace_stats(&self) -> impl Iterator<Item = (usize, KeyspaceStats)> {
+        self.0.iter().filter_map(|(k, v)| to_keyspace_stats(k, v))
     }
 
-    pub fn to_slot_stats(&self) -> impl Iterator<Item = (Slot, KeyspaceStats)> {
-        self.to_database_stats().filter_map(|(db_id, stats)| {
-            let slot = Slot::new(db_id.try_into().ok()?)?;
-            Some((slot, stats))
-        })
+    pub fn into_keyspace_stats(self) -> impl Iterator<Item = (usize, KeyspaceStats)> {
+        self.0
+            .into_iter()
+            .filter_map(|(k, v)| to_keyspace_stats(&k, &v))
     }
+}
+
+fn to_keyspace_stats(k: &[u8], v: &[u8]) -> Option<(usize, KeyspaceStats)> {
+    let db_id = parse_int(k.strip_prefix(b"db")?)?;
+    let stats = KeyspaceStats::from_bytes(v)?;
+    Some((db_id, stats))
 }
 
 pub struct KeyspaceStats {
@@ -176,6 +179,33 @@ pub struct KeyspaceStats {
 }
 
 impl KeyspaceStats {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut parts = bytes.split_str(b",");
+        let keys = parts.next()?.strip_prefix(b"keys=")?;
+        let expires = parts.next()?.strip_prefix(b"expires=")?;
+        let avg_ttl = parts.next()?.strip_prefix(b"avg_ttl=")?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            keys: parse_int(keys)?,
+            expires: parse_int(expires)?,
+            avg_ttl: parse_int(avg_ttl)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> BytesMut {
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut bytes = BytesMut::new();
+        bytes.put_slice(b"keys=");
+        bytes.put_slice(itoa_buf.format(self.keys).as_bytes());
+        bytes.put_slice(b",expires=");
+        bytes.put_slice(itoa_buf.format(self.expires).as_bytes());
+        bytes.put_slice(b",avg_ttl=");
+        bytes.put_slice(itoa_buf.format(self.avg_ttl).as_bytes());
+        bytes
+    }
+
     pub fn aggregate(stats: impl IntoIterator<Item = Self>) -> Self {
         let mut keys = Saturating(0);
         let mut expires = Saturating(0);

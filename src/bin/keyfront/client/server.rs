@@ -1,18 +1,13 @@
-use crate::client::{Client, CommandError, ConnectionError};
-use bstr::ByteSlice;
-use bytes::BytesMut;
-use keyfront::{
-    ByteBuf,
-    net::Address,
-    query,
-    reply::{InfoReply, KeyspaceStats},
-    resp::WriteResp,
+use crate::{
+    backend::{Backend, SyncMode},
+    client::{Client, CommandError},
 };
+use keyfront::{ByteBuf, net::Address, reply::Info, resp::WriteResp};
 use std::{net::SocketAddr, sync::atomic};
-use tracing::{debug, info};
+use tracing::info;
 
 #[expect(clippy::unnecessary_wraps)]
-impl Client<'_> {
+impl<B: Backend> Client<'_, B> {
     // SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] [ABORT]
     pub(super) fn shutdown(&self, args: &[ByteBuf]) -> Result<(), CommandError> {
         const OPTS: &[&[u8]] = &[b"NOSAVE", b"SAVE", b"NOW", b"FORCE", b"ABORT"];
@@ -29,14 +24,11 @@ impl Client<'_> {
     }
 
     // INFO [section [section ...]]
-    pub(super) async fn info(&mut self, query: BytesMut) -> Result<(), CommandError> {
-        let info_reply = self.send_query(None, query).await?;
-        let mut info = InfoReply::from_bytes(info_reply)
-            .ok_or(CommandError::Connection(ConnectionError::UnexpectedReply))?;
+    pub(super) async fn info(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
+        let mut info = self.server.backend.info(args).await?;
         let mut itoa_buf = itoa::Buffer::new();
-        let config = &self.server.config;
 
-        if let Some(section) = info.section_mut(InfoReply::SERVER) {
+        if let Some(section) = info.section_mut(Info::SERVER) {
             let mut tcp_addr = None;
             let mut unix_addr = None;
             for addr in &self.server.bound_addrs {
@@ -47,11 +39,11 @@ impl Client<'_> {
                 }
             }
 
-            section.replace(
+            section.insert(
                 "tcp_port",
                 itoa_buf.format(tcp_addr.map_or(0, SocketAddr::port)),
             );
-            section.replace("redis_mode", "cluster");
+            section.insert("redis_mode", "cluster");
             section.replace("server_mode", "cluster");
 
             section.retain(|k, _| !k.starts_with(b"listener"));
@@ -66,47 +58,33 @@ impl Client<'_> {
             }
         }
 
-        if let Some(section) = info.section_mut(InfoReply::CLIENTS) {
-            let max_clients = config.max_clients.get();
-            section.replace(
+        if let Some(section) = info.section_mut(Info::CLIENTS) {
+            let max_clients = self.server.config.max_clients.get();
+            section.insert(
                 "connected_clients",
                 itoa_buf.format(max_clients - self.server.clients_sem.available_permits()),
             );
-            section.replace("maxclients", itoa_buf.format(max_clients));
+            section.insert("maxclients", itoa_buf.format(max_clients));
         }
 
-        if let Some(section) = info.section_mut(InfoReply::STATS) {
+        if let Some(section) = info.section_mut(Info::STATS) {
             let stats = &self.server.stats;
-            section.replace(
+            section.insert(
                 "total_connections_received",
                 itoa_buf.format(stats.connections.load(atomic::Ordering::Relaxed)),
             );
-            section.replace(
+            section.insert(
                 "total_commands_processed",
                 itoa_buf.format(stats.commands.load(atomic::Ordering::Relaxed)),
             );
-            section.replace(
+            section.insert(
                 "rejected_connections",
                 itoa_buf.format(stats.rejected_connections.load(atomic::Ordering::Relaxed)),
             );
         }
 
-        if let Some(section) = info.section_mut(InfoReply::CLUSTER) {
-            section.replace("cluster_enabled", "1");
-        }
-
-        if let Some(section) = info.section_mut(InfoReply::KEYSPACE) {
-            let stats = KeyspaceStats::aggregate(section.to_slot_stats().map(|(_, stats)| stats));
-            section.clear();
-            if stats.keys > 0 || stats.expires > 0 {
-                section.insert(
-                    "db0",
-                    format!(
-                        "keys={},expires={},avg_ttl={}",
-                        stats.keys, stats.expires, stats.avg_ttl
-                    ),
-                );
-            }
+        if let Some(section) = info.section_mut(Info::CLUSTER) {
+            section.insert("cluster_enabled", "1");
         }
 
         self.reply.write_bulk(info.to_bytes());
@@ -114,30 +92,24 @@ impl Client<'_> {
     }
 
     pub(super) async fn dbsize(&mut self) -> Result<(), CommandError> {
-        fn compute_num_keys(info_reply: BytesMut) -> Option<usize> {
-            let info = InfoReply::from_bytes(info_reply)?;
-            let keyspace = info.section(InfoReply::KEYSPACE)?;
-            let stats = KeyspaceStats::aggregate(keyspace.to_slot_stats().map(|(_, stats)| stats));
-            Some(stats.keys)
+        let mut num_keys = 0usize;
+        for (_, stats) in self.server.backend.slot_stats().await? {
+            num_keys = num_keys.saturating_add(stats.keys);
         }
-
-        let info_reply = self.send_query(None, query!("INFO", "keyspace")).await?;
-        let num_keys = compute_num_keys(info_reply)
-            .ok_or(CommandError::Connection(ConnectionError::UnexpectedReply))?;
         self.reply.write_integer(num_keys);
         Ok(())
     }
 
-    // FLUSHDB [ASYNC | SYNC]
-    pub(super) async fn flushdb(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
-        let query = match args {
-            [opt] if opt.eq_ignore_ascii_case(b"ASYNC") | opt.eq_ignore_ascii_case(b"SYNC") => {
-                query!("FLUSHALL", opt)
-            }
-            [] => query!("FLUSHALL"),
+    // FLUSHALL [ASYNC | SYNC]
+    pub(super) async fn flushall(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
+        let sync = match args {
+            [] => None,
+            [opt] if opt.eq_ignore_ascii_case(b"ASYNC") => Some(SyncMode::Async),
+            [opt] if opt.eq_ignore_ascii_case(b"SYNC") => Some(SyncMode::Sync),
             _ => return Err(CommandError::Syntax),
         };
-        self.reply.unsplit(self.send_query(None, query).await?);
+        self.server.backend.clear(sync).await?;
+        self.reply.write_ok();
         Ok(())
     }
 
@@ -150,21 +122,6 @@ impl Client<'_> {
     pub(super) fn replicaof(&mut self) -> Result<(), CommandError> {
         self.reply
             .write_error("-ERR REPLICAOF not allowed in cluster mode.");
-        Ok(())
-    }
-
-    pub(super) async fn debug(
-        &mut self,
-        query: BytesMut,
-        args: &[ByteBuf],
-    ) -> Result<(), CommandError> {
-        match args {
-            [subcommand, message] if subcommand.eq_ignore_ascii_case(b"LOG") => {
-                debug!("DEBUG LOG: {}", message.as_bstr());
-            }
-            _ => {}
-        }
-        self.reply.unsplit(self.send_query(None, query).await?);
         Ok(())
     }
 }

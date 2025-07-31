@@ -92,6 +92,10 @@ impl QueryDecoder {
         &self.args
     }
 
+    pub fn args_mut(&mut self) -> &mut Vec<ByteBuf> {
+        &mut self.args
+    }
+
     fn decode_multibulk(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, ProtocolError> {
         let num_args = match self.num_args {
             None => {
@@ -269,6 +273,7 @@ const OK: &[u8] = b"OK";
 pub trait ReadResp {
     fn read_simple(&mut self) -> Option<BytesMut>;
     fn read_ok(&mut self) -> bool;
+    fn read_integer<T: crate::string::Integer>(&mut self) -> Option<T>;
     fn read_bulk(&mut self) -> Option<BytesMut>;
     fn read_array(&mut self) -> Option<usize>;
 }
@@ -294,6 +299,16 @@ impl ReadResp for BytesMut {
         };
         self.advance(1 + OK.len() + CRLF.len());
         true
+    }
+
+    fn read_integer<T: crate::string::Integer>(&mut self) -> Option<T> {
+        let [b':', rest @ ..] = self.as_ref() else {
+            return None;
+        };
+        let header = extract_line(rest)?;
+        let value = parse_int(header)?;
+        self.advance(1 + header.len() + CRLF.len());
+        Some(value)
     }
 
     fn read_bulk(&mut self) -> Option<BytesMut> {

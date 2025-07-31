@@ -1,13 +1,15 @@
-use crate::client::{Client, CommandError, ConnectionError};
+use crate::{
+    backend::{Backend, BackendError},
+    client::{Client, CommandError},
+};
 use bstr::ByteSlice;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use keyfront::{
     ByteBuf,
     cluster::{CLUSTER_SLOTS, Node, Slot},
     commands::ClusterCommand,
-    query,
-    reply::{InfoReply, ScanReply, Section},
-    resp::{ReadResp, WriteResp},
+    reply::Section,
+    resp::WriteResp,
     string::parse_int,
 };
 use std::ops::Range;
@@ -33,14 +35,14 @@ enum ClusterError {
     SlotAlreadyUnassigned(u16),
 }
 
-impl From<ConnectionError> for ClusterError {
-    fn from(e: ConnectionError) -> Self {
-        Self::Command(e.into())
+impl From<BackendError> for ClusterError {
+    fn from(e: BackendError) -> Self {
+        Self::Command(CommandError::Connection(e.into()))
     }
 }
 
 #[expect(clippy::unnecessary_wraps)]
-impl Client<'_> {
+impl<B: Backend> Client<'_, B> {
     pub(super) async fn cluster(
         &mut self,
         command: ClusterCommand,
@@ -144,13 +146,13 @@ impl Client<'_> {
             num_items += 1;
         }
         self.reply.write_array(num_items);
-        self.reply.unsplit(buf);
+        self.append_reply(buf);
         Ok(())
     }
 
     // CLUSTER SLOT-STATS <SLOTSRANGE start-slot end-slot | ORDERBY metric [LIMIT limit] [ASC | DESC]>
     async fn cluster_slot_stats(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        fn to_reply(key_counts: impl IntoIterator<Item = (Slot, usize)>) -> BytesMut {
+        fn write_reply(key_counts: impl IntoIterator<Item = (Slot, usize)>, out: &mut BytesMut) {
             let mut stats_to_reply = BytesMut::new();
             let mut num_slots_in_reply = 0;
             for (slot, key_count) in key_counts {
@@ -161,10 +163,8 @@ impl Client<'_> {
                 stats_to_reply.write_integer(key_count);
                 num_slots_in_reply += 1;
             }
-            let mut reply = BytesMut::new();
-            reply.write_array(num_slots_in_reply);
-            reply.unsplit(stats_to_reply);
-            reply
+            out.write_array(num_slots_in_reply);
+            out.unsplit(stats_to_reply);
         }
 
         match args {
@@ -183,7 +183,7 @@ impl Client<'_> {
                     .await?
                     .into_iter()
                     .filter(|&(slot, _)| slot >= start && slot <= end);
-                self.reply.unsplit(to_reply(key_counts));
+                write_reply(key_counts, &mut self.reply);
                 Ok(())
             }
             [subcommand, metric, opts @ ..] if subcommand.eq_ignore_ascii_case(b"ORDERBY") => {
@@ -244,29 +244,18 @@ impl Client<'_> {
                     .then_with(|| a_slot.cmp(b_slot))
                 });
                 let key_counts = key_counts.into_iter().take(limit);
-                self.reply.unsplit(to_reply(key_counts));
+                write_reply(key_counts, &mut self.reply);
                 Ok(())
             }
             _ => Err(CommandError::Syntax.into()),
         }
     }
 
-    async fn slot_key_counts(&self) -> Result<Vec<(Slot, usize)>, ConnectionError> {
-        fn to_key_counts(info_reply: BytesMut) -> Option<Box<[usize; CLUSTER_SLOTS]>> {
-            let info = InfoReply::from_bytes(info_reply)?;
-            let keyspace = info.section(InfoReply::KEYSPACE)?;
-            let mut key_counts: Box<[_; CLUSTER_SLOTS]> = vec![0; CLUSTER_SLOTS]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap();
-            for (slot, stats) in keyspace.to_slot_stats() {
-                key_counts[slot.index()] = stats.keys;
-            }
-            Some(key_counts)
+    async fn slot_key_counts(&self) -> Result<Vec<(Slot, usize)>, BackendError> {
+        let mut key_counts: Box<[_; CLUSTER_SLOTS]> = vec![0; CLUSTER_SLOTS].try_into().unwrap();
+        for (slot, stats) in self.server.backend.slot_stats().await? {
+            key_counts[slot.index()] = stats.keys;
         }
-
-        let info_reply = self.send_query(None, query!("INFO", "keyspace")).await?;
-        let key_counts = to_key_counts(info_reply).ok_or(ConnectionError::UnexpectedReply)?;
         let key_counts = self
             .server
             .slots
@@ -386,54 +375,12 @@ impl Client<'_> {
             .and_then(Slot::new)
             .ok_or(ClusterError::InvalidSlot)?;
         self.reply
-            .unsplit(self.send_query(slot, query!("DBSIZE")).await?);
+            .write_integer(self.server.backend.count_keys(slot).await?);
         Ok(())
     }
 
     // CLUSTER GETKEYSINSLOT slot count
     async fn cluster_getkeysinslot(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        async fn reply_keys_in_slot(
-            client: &mut Client<'_>,
-            slot: Slot,
-            count: usize,
-        ) -> Result<(), ConnectionError> {
-            let mut remaining = count;
-            let mut cursor = Bytes::from_static(b"0");
-            let mut keys_to_reply = BytesMut::new();
-            let mut num_keys_in_reply = 0;
-            let mut itoa_buf = itoa::Buffer::new();
-            while remaining > 0 {
-                let query = query!("SCAN", cursor, "COUNT", itoa_buf.format(remaining));
-                let scan_reply = client.send_query(slot, query).await?;
-                let mut scan_reply =
-                    ScanReply::from_bytes(scan_reply).ok_or(ConnectionError::UnexpectedReply)?;
-
-                if scan_reply.num_keys > remaining {
-                    for _ in 0..remaining {
-                        let key = scan_reply
-                            .keys
-                            .read_bulk()
-                            .ok_or(ConnectionError::UnexpectedReply)?;
-                        keys_to_reply.write_bulk(key);
-                    }
-                    num_keys_in_reply += remaining;
-                    break;
-                }
-                keys_to_reply.unsplit(scan_reply.keys);
-                num_keys_in_reply += scan_reply.num_keys;
-
-                if scan_reply.cursor == b"0".as_ref() {
-                    break;
-                }
-
-                remaining -= scan_reply.num_keys;
-                cursor = scan_reply.cursor.freeze();
-            }
-            client.reply.write_array(num_keys_in_reply);
-            client.reply.unsplit(keys_to_reply);
-            Ok(())
-        }
-
         let [slot, count] = args else { unreachable!() };
         let (Some(slot), Some(count)) = (parse_int::<i64>(slot), parse_int::<i64>(count)) else {
             return Err(CommandError::InvalidInteger.into());
@@ -444,10 +391,11 @@ impl Client<'_> {
                 .write_error("-ERR Invalid slot or number of keys");
             return Ok(());
         };
-
-        reply_keys_in_slot(self, slot, count)
+        self.server
+            .backend
+            .dump_keys(slot, count, &mut self.reply)
             .await
-            .map_err(ClusterError::from)
+            .map_err(Into::into)
     }
 
     pub(super) fn readonly(&mut self) -> Result<(), CommandError> {

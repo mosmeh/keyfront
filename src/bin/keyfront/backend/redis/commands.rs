@@ -1,4 +1,7 @@
-use crate::client::{Client, CommandError, ConnectionError};
+use crate::{
+    backend::{Backend, BackendError, redis::RedisBackend},
+    client::{Client, CommandError},
+};
 use bstr::ByteSlice;
 use bytes::BytesMut;
 use keyfront::{
@@ -10,16 +13,20 @@ use keyfront::{
     string::parse_int,
 };
 use std::cmp::Ordering;
+use tracing::debug;
 
-#[expect(clippy::unnecessary_wraps)]
-impl Client<'_> {
+impl RedisBackend {
     // COPY source destination [DB destination-db] [REPLACE]
-    pub(super) async fn copy(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
+    pub(super) async fn copy(
+        &self,
+        client: &mut Client<'_, Self>,
+        args: &[ByteBuf],
+    ) -> Result<(), CommandError> {
         let [source, destination, opts @ ..] = args else {
             unreachable!()
         };
 
-        let slot = self.compute_slot([source, destination])?;
+        let slot = client.compute_slot([source, destination])?;
 
         let mut opts = opts;
         let mut replace = false;
@@ -29,7 +36,9 @@ impl Client<'_> {
                 [opt, db_id, rest @ ..] if opt.eq_ignore_ascii_case(b"DB") => {
                     let db_id: i32 = parse_int(db_id).ok_or(CommandError::InvalidInteger)?;
                     if db_id != 0 {
-                        self.reply.write_error("-ERR DB index is out of range");
+                        client
+                            .reply_mut()
+                            .write_error("-ERR DB index is out of range");
                         return Ok(());
                     }
                     opts = rest;
@@ -47,19 +56,14 @@ impl Client<'_> {
         } else {
             query!("COPY", source, destination)
         };
-        self.reply.unsplit(self.send_query(slot, query).await?);
-        Ok(())
-    }
-
-    pub(super) fn r#move(&mut self) -> Result<(), CommandError> {
-        self.reply
-            .write_error("-ERR MOVE is not allowed in cluster mode");
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA] [STORE destination]
     pub(super) async fn sort(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
@@ -72,7 +76,7 @@ impl Client<'_> {
             match opts {
                 [] => break,
                 [opt, _pattern, rest @ ..] if opt.eq_ignore_ascii_case(b"BY") => opts = rest,
-                [opt, _ofset, _count, rest @ ..] if opt.eq_ignore_ascii_case(b"LIMIT") => {
+                [opt, _offset, _count, rest @ ..] if opt.eq_ignore_ascii_case(b"LIMIT") => {
                     opts = rest;
                 }
                 [opt, _pattern, rest @ ..] if opt.eq_ignore_ascii_case(b"GET") => opts = rest,
@@ -84,35 +88,40 @@ impl Client<'_> {
             }
         }
         let slot = if let Some(store_key) = store_key {
-            self.compute_slot([key, store_key])?
+            client.compute_slot([key, store_key])?
         } else {
-            self.compute_slot([key])?
+            client.compute_slot([key])?
         };
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA]
     pub(super) async fn sort_ro(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
         let [key, ..] = args else { unreachable!() };
-        let slot = self.compute_slot([key])?;
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        let slot = client.compute_slot([key])?;
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
-    pub(super) async fn scan(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
+    pub(super) async fn scan(
+        &self,
+        client: &mut Client<'_, Self>,
+        args: &[ByteBuf],
+    ) -> Result<(), CommandError> {
         const DEFAULT_SCAN_COMMAND_COUNT: usize = 10;
 
         let [cursor, opts @ ..] = args else {
             unreachable!()
         };
         let Some(cursor) = parse_int::<u64>(cursor) else {
-            self.reply.write_error("-ERR invalid cursor");
+            client.reply_mut().write_error("-ERR invalid cursor");
             return Ok(());
         };
         let mut opts = opts;
@@ -143,7 +152,11 @@ impl Client<'_> {
                         &[b"string", b"list", b"set", b"zset", b"hash", b"stream"];
 
                     if !OBJ_TYPE_NAMES.iter().any(|x| x.eq_ignore_ascii_case(value)) {
-                        write!(self.reply, "-ERR unknown type name '{}'", value.as_bstr());
+                        write!(
+                            client.reply_mut(),
+                            "-ERR unknown type name '{}'",
+                            value.as_bstr()
+                        );
                         return Ok(());
                     }
                     ty = Some(value);
@@ -162,11 +175,12 @@ impl Client<'_> {
         };
         let next_cursor = scan.scan(self, cursor).await?;
 
-        self.reply.write_array(2);
-        self.reply
+        client.reply_mut().write_array(2);
+        client
+            .reply_mut()
             .write_bulk(itoa::Buffer::new().format(next_cursor));
-        self.reply.write_array(scan.num_keys_in_reply);
-        self.reply.unsplit(scan.keys_to_reply);
+        client.reply_mut().write_array(scan.num_keys_in_reply);
+        client.append_reply(scan.keys_to_reply);
         Ok(())
     }
 }
@@ -183,7 +197,7 @@ impl Scan<'_> {
     /// Scans keys until there is no more keys to scan or `remaining` is exhausted.
     ///
     /// Returns the next cursor.
-    async fn scan(&mut self, client: &Client<'_>, cursor: u64) -> Result<u64, ConnectionError> {
+    async fn scan(&mut self, backend: &RedisBackend, cursor: u64) -> Result<u64, BackendError> {
         let mut slot = Slot::new(cursor as u16 & Slot::MAX).unwrap();
         let mut cursor_in_slot = cursor >> CLUSTER_SLOT_MASK_BITS;
 
@@ -192,11 +206,11 @@ impl Scan<'_> {
                 Ordering::Less => {
                     // Fast-forward to the slot
                     slot = slot_from_pattern;
-                    self.scan_slot_to_end(client, slot, 0).await?
+                    self.scan_slot_to_end(backend, slot, 0).await?
                 }
                 Ordering::Equal => {
                     // The cursor is at the correct slot
-                    self.scan_slot_to_end(client, slot, cursor_in_slot).await?
+                    self.scan_slot_to_end(backend, slot, cursor_in_slot).await?
                 }
                 Ordering::Greater => {
                     // The cursor is already past the slot
@@ -209,7 +223,7 @@ impl Scan<'_> {
             }
         } else {
             while self.remaining > 0 {
-                cursor_in_slot = self.scan_slot_to_end(client, slot, cursor_in_slot).await?;
+                cursor_in_slot = self.scan_slot_to_end(backend, slot, cursor_in_slot).await?;
                 if cursor_in_slot != 0 {
                     continue;
                 }
@@ -225,7 +239,7 @@ impl Scan<'_> {
 
         let next_cursor = cursor_in_slot
             .checked_shl(CLUSTER_SLOT_MASK_BITS as u32)
-            .ok_or(ConnectionError::UnexpectedReply)?
+            .ok_or(BackendError::UnexpectedReply)?
             | u64::from(slot.get());
         Ok(next_cursor)
     }
@@ -235,10 +249,10 @@ impl Scan<'_> {
     /// Returns the next cursor.
     async fn scan_slot_to_end(
         &mut self,
-        client: &Client<'_>,
+        backend: &RedisBackend,
         slot: Slot,
         mut cursor: u64,
-    ) -> Result<u64, ConnectionError> {
+    ) -> Result<u64, BackendError> {
         let mut itoa_buf = itoa::Buffer::new();
         while self.remaining > 0 {
             let mut query = BytesMut::new();
@@ -258,9 +272,9 @@ impl Scan<'_> {
                 query.write_bulk(ty);
             }
 
-            let scan_reply = client.send_query(slot, query).await?;
+            let scan_reply = backend.raw_query(slot, query).await?;
             let scan_reply =
-                ScanReply::from_bytes(scan_reply).ok_or(ConnectionError::UnexpectedReply)?;
+                ScanReply::from_bytes(scan_reply).ok_or(BackendError::UnexpectedReply)?;
 
             self.keys_to_reply.unsplit(scan_reply.keys);
             self.num_keys_in_reply += scan_reply.num_keys;
@@ -269,7 +283,7 @@ impl Scan<'_> {
             // scanning as soon as we reach the requested number.
             self.remaining = self.remaining.saturating_sub(scan_reply.num_keys);
 
-            cursor = parse_int(&scan_reply.cursor).ok_or(ConnectionError::UnexpectedReply)?;
+            cursor = parse_int(&scan_reply.cursor).ok_or(BackendError::UnexpectedReply)?;
             if cursor == 0 {
                 break;
             }
@@ -278,23 +292,25 @@ impl Scan<'_> {
     }
 }
 
-impl Client<'_> {
+impl RedisBackend {
     // LMPOP numkeys key [key ...] <LEFT | RIGHT> [COUNT count]
     pub(super) async fn lmpop(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
-        self.generic_multi_key(query, args, None).await
+        self.generic_multi_key(client, query, args, None).await
     }
 
     // SINTERCARD numkeys key [key ...] [LIMIT limit]
     pub(super) async fn sintercard(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
-        self.generic_multi_key(query, args, None).await
+        self.generic_multi_key(client, query, args, None).await
     }
 
     // ZINTER numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>] [WITHSCORES]
@@ -303,25 +319,28 @@ impl Client<'_> {
     // ZDIFF numkeys key [key ...] [WITHSCORES]
     // ZMPOP numkeys key [key ...] <MIN | MAX> [COUNT count]
     pub(super) async fn zset_multi_key(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
-        self.generic_multi_key(query, args, None).await
+        self.generic_multi_key(client, query, args, None).await
     }
 
     // ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>]
     // ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>]
     // ZDIFFSTORE destination numkeys key [key ...]
     pub(super) async fn zset_multi_key_store(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
         let [destination, opts @ ..] = args else {
             unreachable!()
         };
-        self.generic_multi_key(query, opts, destination).await
+        self.generic_multi_key(client, query, opts, destination)
+            .await
     }
 
     // EVAL script numkeys [key [key ...]] [arg [arg ...]]
@@ -331,17 +350,19 @@ impl Client<'_> {
     // FCALL function numkeys [key [key ...]] [arg [arg ...]]
     // FCALL_RO function numkeys [key [key ...]] [arg [arg ...]]
     pub(super) async fn eval(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
         let [_, opts @ ..] = args else { unreachable!() };
-        self.generic_multi_key(query, opts, None).await
+        self.generic_multi_key(client, query, opts, None).await
     }
 
     // COMMAND numkeys [key [key ...]] [arg [arg ...]]
     async fn generic_multi_key(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
         additional_key: impl Into<Option<&ByteBuf>>,
@@ -353,12 +374,14 @@ impl Client<'_> {
         let keys = match num_keys.try_into() {
             Ok(n) if n <= opts.len() => &opts[..n],
             Err(_) if num_keys < 0 => {
-                self.reply
+                client
+                    .reply_mut()
                     .write_error("-ERR Number of keys can't be negative");
                 return Ok(());
             }
             _ => {
-                self.reply
+                client
+                    .reply_mut()
                     .write_error("-ERR Number of keys can't be greater than number of args");
                 return Ok(());
             }
@@ -366,15 +389,16 @@ impl Client<'_> {
         let slot = if keys.is_empty() {
             None
         } else {
-            Some(self.compute_slot(keys.iter().chain(additional_key.into().into_iter()))?)
+            Some(client.compute_slot(keys.iter().chain(additional_key.into().into_iter()))?)
         };
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
     pub(super) async fn xread(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
@@ -387,7 +411,7 @@ impl Client<'_> {
                 }
                 [opt, rest @ ..] if opt.eq_ignore_ascii_case(b"STREAMS") && !rest.is_empty() => {
                     if !rest.len().is_multiple_of(2) {
-                        self.reply.write_error("-ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
+                        client.reply_mut().write_error("-ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
                         return Ok(());
                     }
                     opts = rest;
@@ -396,14 +420,15 @@ impl Client<'_> {
                 _ => return Err(CommandError::Syntax),
             }
         }
-        let slot = self.compute_slot(opts.iter().take(opts.len() / 2))?;
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        let slot = client.compute_slot(opts.iter().take(opts.len() / 2))?;
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] id [id ...]
     pub(super) async fn xreadgroup(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
@@ -422,7 +447,7 @@ impl Client<'_> {
                 [opt, rest @ ..] if opt.eq_ignore_ascii_case(b"NOACK") => opts = rest,
                 [opt, rest @ ..] if opt.eq_ignore_ascii_case(b"STREAMS") && !rest.is_empty() => {
                     if !rest.len().is_multiple_of(2) {
-                        self.reply.write_error("-ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.");
+                        client.reply_mut().write_error("-ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.");
                         return Ok(());
                     }
                     opts = rest;
@@ -432,41 +457,45 @@ impl Client<'_> {
             }
         }
         if !has_group {
-            self.reply
+            client
+                .reply_mut()
                 .write_error("-ERR Missing GROUP option for XREADGROUP");
             return Ok(());
         }
-        let slot = self.compute_slot(opts.iter().take(opts.len() / 2))?;
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        let slot = client.compute_slot(opts.iter().take(opts.len() / 2))?;
+        client.append_reply(self.raw_query(slot, query).await?);
         Ok(())
     }
 
     // GEORADIUS key longitude latitude radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE key | STOREDIST key]
     pub(super) async fn georadius(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
         let [key, _longitude, _latitude, _radius, _unit, opts @ ..] = args else {
             unreachable!()
         };
-        self.generic_georadius(query, key, opts).await
+        self.generic_georadius(client, query, key, opts).await
     }
 
     // GEORADIUSBYMEMBER key member radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE key | STOREDIST key]
     pub(super) async fn georadiusbymember(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         args: &[ByteBuf],
     ) -> Result<(), CommandError> {
         let [key, _member, _radius, _unit, opts @ ..] = args else {
             unreachable!()
         };
-        self.generic_georadius(query, key, opts).await
+        self.generic_georadius(client, query, key, opts).await
     }
 
     async fn generic_georadius(
-        &mut self,
+        &self,
+        client: &mut Client<'_, Self>,
         query: BytesMut,
         key: &ByteBuf,
         mut opts: &[ByteBuf],
@@ -486,11 +515,27 @@ impl Client<'_> {
             }
         }
         let slot = if let Some(store_key) = store_key {
-            self.compute_slot([key, store_key])?
+            client.compute_slot([key, store_key])?
         } else {
-            self.compute_slot([key])?
+            client.compute_slot([key])?
         };
-        self.reply.unsplit(self.send_query(slot, query).await?);
+        client.append_reply(self.raw_query(slot, query).await?);
+        Ok(())
+    }
+
+    pub(super) async fn debug(
+        &self,
+        client: &mut Client<'_, Self>,
+        query: BytesMut,
+        args: &[ByteBuf],
+    ) -> Result<(), CommandError> {
+        match args {
+            [subcommand, message] if subcommand.eq_ignore_ascii_case(b"LOG") => {
+                debug!("DEBUG LOG: {}", message.as_bstr());
+            }
+            _ => {}
+        }
+        client.append_reply(self.raw_query(None, query).await?);
         Ok(())
     }
 }

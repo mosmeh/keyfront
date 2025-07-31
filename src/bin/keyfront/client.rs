@@ -1,9 +1,11 @@
 mod cluster;
 mod connection;
-mod generic;
 mod server;
 
-use crate::{Server, backend::BackendError};
+use crate::{
+    Server,
+    backend::{Backend, BackendError},
+};
 use bstr::ByteSlice;
 use bytes::{Buf, BytesMut};
 use futures::StreamExt;
@@ -23,19 +25,16 @@ use tokio_util::codec::FramedRead;
 use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
-enum ConnectionError {
+pub enum ConnectionError {
     #[error("communication with backend failed: {0}")]
     Backend(#[from] BackendError),
-
-    #[error("unexpected reply from backend")]
-    UnexpectedReply,
 
     #[error("user requested closing connection")]
     Quit,
 }
 
 #[derive(Debug, thiserror::Error)]
-enum CommandError {
+pub enum CommandError {
     #[error(transparent)]
     Connection(#[from] ConnectionError),
 
@@ -61,15 +60,21 @@ enum CommandError {
     Unimplemented,
 }
 
-pub struct Client<'a> {
-    server: &'a Server,
+impl From<BackendError> for CommandError {
+    fn from(e: BackendError) -> Self {
+        Self::Connection(ConnectionError::Backend(e))
+    }
+}
+
+pub struct Client<'a, B> {
+    server: &'a Server<B>,
     id: u64,
     name: Option<ByteBuf>,
     reply: BytesMut,
 }
 
-impl<'a> Client<'a> {
-    pub async fn run<R, W>(server: &'a Server, reader: R, mut writer: W)
+impl<'a, B: Backend> Client<'a, B> {
+    pub async fn run<R, W>(server: &'a Server<B>, reader: R, mut writer: W)
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -96,8 +101,8 @@ impl<'a> Client<'a> {
                             break;
                         }
                     };
-                    let args = stream.decoder().args();
-                    match client.relay_or_intercept_command(query, args).await {
+                    let args = stream.decoder_mut().args_mut();
+                    match client.handle_query(query, args).await {
                         Ok(()) => {}
                         Err(ConnectionError::Quit) => break,
                         Err(e) => {
@@ -116,10 +121,10 @@ impl<'a> Client<'a> {
         let _ = writer.write_all_buf(&mut client.reply).await;
     }
 
-    async fn relay_or_intercept_command(
+    async fn handle_query(
         &mut self,
         query: BytesMut,
-        args: &[ByteBuf],
+        args: &mut [ByteBuf],
     ) -> Result<(), ConnectionError> {
         fn append_args_to_error(args: &[ByteBuf], out: &mut Vec<u8>) {
             out.extend_from_slice(b"', with args beginning with: ");
@@ -187,45 +192,19 @@ impl<'a> Client<'a> {
         &mut self,
         query: BytesMut,
         command: &Command,
-        args: &[ByteBuf],
+        args: &mut [ByteBuf],
     ) -> Result<(), CommandError> {
         if !command.arity.matches(args.len()) {
             return Err(CommandError::WrongArity);
         }
 
         let result = match command.id {
-            CommandId::Copy => self.copy(args).await,
-            CommandId::Move => self.r#move(),
-            CommandId::Sort => self.sort(query, args).await,
-            CommandId::SortRo => self.sort_ro(query, args).await,
-            CommandId::Scan => self.scan(args).await,
-            CommandId::Lmpop => self.lmpop(query, args).await,
-            CommandId::Sintercard => self.sintercard(query, args).await,
-            CommandId::Zinter
-            | CommandId::Zintercard
-            | CommandId::Zunion
-            | CommandId::Zdiff
-            | CommandId::Zmpop => self.zset_multi_key(query, args).await,
-            CommandId::Zinterstore | CommandId::Zunionstore | CommandId::Zdiffstore => {
-                self.zset_multi_key_store(query, args).await
-            }
-            CommandId::Eval
-            | CommandId::EvalRo
-            | CommandId::Evalsha
-            | CommandId::EvalshaRo
-            | CommandId::Fcall
-            | CommandId::FcallRo => self.eval(query, args).await,
-            CommandId::Xread => self.xread(query, args).await,
-            CommandId::Xreadgroup => self.xreadgroup(query, args).await,
-            CommandId::Georadius => self.georadius(query, args).await,
-            CommandId::Georadiusbymember => self.georadiusbymember(query, args).await,
             CommandId::Shutdown => self.shutdown(args),
-            CommandId::Info => self.info(query).await,
+            CommandId::Info => self.info(args).await,
             CommandId::Dbsize => self.dbsize().await,
-            CommandId::Flushdb => self.flushdb(args).await,
+            CommandId::Flushall | CommandId::Flushdb => self.flushall(args).await,
             CommandId::Swapdb => self.swapdb(),
             CommandId::Replicaof | CommandId::Slaveof => self.replicaof(),
-            CommandId::Debug => self.debug(query, args).await,
             CommandId::Quit => self.quit(),
             CommandId::Reset => self.reset(),
             CommandId::Hello => self.hello(args),
@@ -234,51 +213,13 @@ impl<'a> Client<'a> {
             CommandId::Cluster(c) => self.cluster(c, args).await,
             CommandId::Readonly => self.readonly(),
             CommandId::Readwrite => self.readwrite(),
-            CommandId::Asking | CommandId::Migrate | CommandId::Failover => {
-                // Unimplemented features of cluster
-                Err(CommandError::Unimplemented)
-            }
-            CommandId::Acl(_) => Err(CommandError::Unimplemented),
-            CommandId::Keys | CommandId::Randomkey => {
-                // These commands return keys in the currently selected database.
-                // As we use databases to emulate slots, simply relaying them
-                // will only return a subset of keys.
-                Err(CommandError::Unimplemented)
-            }
-            CommandId::Auth
-            | CommandId::Blmove
-            | CommandId::Blmpop
-            | CommandId::Blpop
-            | CommandId::Brpop
-            | CommandId::Brpoplpush
-            | CommandId::Bzmpop
-            | CommandId::Bzpopmax
-            | CommandId::Bzpopmin
-            | CommandId::Wait
-            | CommandId::Waitaof
-            | CommandId::Monitor
-            | CommandId::Subscribe
-            | CommandId::Psubscribe
-            | CommandId::Ssubscribe
-            | CommandId::Multi
-            | CommandId::Watch
-            | CommandId::Sync
-            | CommandId::Psync => {
-                // These commands put the connection into a special state
-                // (blocking, transaction, subscription, etc.)
-                // As we use a single connection to the backend,
-                // simply relaying them will affect the entire server.
-                Err(CommandError::Unimplemented)
-            }
+            CommandId::Move => self.r#move(),
             CommandId::Keyfront => self.keyfront(args).await,
             _ => {
-                let slot = command
-                    .key_spec
-                    .as_ref()
-                    .map(|spec| self.compute_slot(spec.extract_keys(args)))
-                    .transpose()?;
-                self.reply.unsplit(self.send_query(slot, query).await?);
-                Ok(())
+                self.server
+                    .backend
+                    .handle_command(self, query, command, args)
+                    .await
             }
         };
 
@@ -288,51 +229,6 @@ impl<'a> Client<'a> {
             .fetch_add(1, atomic::Ordering::Relaxed);
 
         result
-    }
-
-    async fn send_query<T: Into<Option<Slot>>>(
-        &self,
-        slot: T,
-        bytes: BytesMut,
-    ) -> Result<BytesMut, ConnectionError> {
-        let db_id = slot.into().map(|s| u32::from(s.get()));
-        self.server
-            .backend
-            .as_ref()
-            .ok_or(ConnectionError::Backend(BackendError::Disconnected))?
-            .send(db_id, bytes)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Computes the slot for the given keys.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the keys do not hash to the same slot,
-    /// or if the slot is not served by the current node.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `keys` is empty.
-    fn compute_slot<T, I>(&self, keys: I) -> Result<Slot, CommandError>
-    where
-        T: AsRef<[u8]>,
-        I: IntoIterator<Item = T>,
-    {
-        let slot = Slot::from_keys(keys).ok_or(CommandError::CrossSlot)?;
-        let node = &self.server.slots.read().unwrap()[slot.index()];
-        match node {
-            Some(node) if node == &self.server.this_node => {}
-            Some(node) => {
-                return Err(CommandError::Moved {
-                    slot,
-                    addr: format!("{}:{}", node.addr().ip(), node.addr().port()).into(),
-                });
-            }
-            None => return Err(CommandError::HashSlotNotServed),
-        }
-        Ok(slot)
     }
 
     async fn keyfront(&mut self, args: &[ByteBuf]) -> Result<(), CommandError> {
@@ -367,10 +263,59 @@ impl<'a> Client<'a> {
                 for arg in args {
                     query.write_bulk(arg);
                 }
-                self.reply.unsplit(self.send_query(None, query).await?);
+                self.append_reply(self.server.backend.raw_query(None, query).await?);
                 Ok(())
             }
             _ => Err(CommandError::Syntax),
         }
+    }
+}
+
+impl<B> Client<'_, B> {
+    pub fn reply_mut(&mut self) -> &mut BytesMut {
+        &mut self.reply
+    }
+
+    pub fn append_reply(&mut self, bytes: BytesMut) {
+        self.reply.unsplit(bytes);
+    }
+
+    /// Computes the slot for the given keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the keys do not hash to the same slot,
+    /// or if the slot is not served by the current node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `keys` is empty.
+    pub fn compute_slot<T, I>(&self, keys: I) -> Result<Slot, CommandError>
+    where
+        T: AsRef<[u8]>,
+        I: IntoIterator<Item = T>,
+    {
+        let Some(slot) = Slot::from_keys(keys) else {
+            return Err(CommandError::CrossSlot);
+        };
+        let node = &self.server.slots.read().unwrap()[slot.index()];
+        match node {
+            Some(node) if node == &self.server.this_node => {}
+            Some(node) => {
+                return Err(CommandError::Moved {
+                    slot,
+                    addr: format!("{}:{}", node.addr().ip(), node.addr().port()).into(),
+                });
+            }
+            None => return Err(CommandError::HashSlotNotServed),
+        }
+        Ok(slot)
+    }
+
+    #[expect(clippy::unnecessary_wraps)]
+    fn r#move(&mut self) -> Result<(), CommandError> {
+        self.reply
+            .write_error("-ERR MOVE is not allowed in cluster mode");
+        Ok(())
     }
 }

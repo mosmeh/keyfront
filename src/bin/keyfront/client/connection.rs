@@ -1,12 +1,12 @@
 use crate::{
-    backend::{Backend, COMPATIBLE_VERSION},
+    backend::Backend,
     client::{Client, CommandError, ConnectionError},
 };
 use bstr::ByteSlice;
 use keyfront::{ByteBuf, commands::ClientCommand, resp::WriteResp, string::parse_int};
 
 #[expect(clippy::unnecessary_wraps)]
-impl Client<'_> {
+impl<B: Backend> Client<'_, B> {
     pub(super) fn quit(&mut self) -> Result<(), CommandError> {
         self.reply.write_ok();
         Err(ConnectionError::Quit.into())
@@ -75,12 +75,7 @@ impl Client<'_> {
         self.reply.write_bulk("redis");
 
         self.reply.write_bulk("version");
-        self.reply.write_bulk(
-            self.server
-                .backend
-                .as_ref()
-                .map_or(COMPATIBLE_VERSION, Backend::version),
-        );
+        self.reply.write_bulk(self.server.backend.version());
 
         self.reply.write_bulk("proto");
         self.reply.write_integer(2);
