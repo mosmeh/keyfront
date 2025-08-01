@@ -29,7 +29,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    select,
+    pin, select,
     signal::unix::{SignalKind, signal},
     sync::{Semaphore, TryAcquireError},
 };
@@ -453,9 +453,12 @@ async fn run_accept_loop<L, B>(
     L: Listener,
     B: Backend,
 {
+    pin! {
+        let shutdown_requested = shutdown.requested();
+    }
     loop {
         select! {
-            () = shutdown.requested() => break,
+            () = &mut shutdown_requested => break,
             result = listener.accept() => {
                 let (reader, mut writer) = match result {
                     Ok(stream) => stream,

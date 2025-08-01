@@ -23,7 +23,7 @@ use std::{collections::VecDeque, str::FromStr, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UnixStream},
-    select,
+    pin, select,
     sync::{mpsc, oneshot},
 };
 use tokio_util::{codec::FramedRead, task::TaskTracker, time::FutureExt};
@@ -446,9 +446,12 @@ async fn run_multiplexer<R, W>(
     let mut selected_db = 0;
     let mut reply_queue = VecDeque::new();
     let mut itoa_buf = itoa::Buffer::new();
+    pin! {
+        let shutdown_requested = shutdown.requested();
+    }
     loop {
         select! {
-            () = shutdown.requested() => break,
+            () = &mut shutdown_requested => break,
             result = writer.write_buf(&mut query_buf), if query_buf.has_remaining() => {
                 if let Err(e) = result {
                     error!("Failed to write to backend: {e}");
@@ -512,9 +515,12 @@ async fn run_health_checker(
     let ping = query!("PING");
     let mut interval = tokio::time::interval(ping_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pin! {
+        let shutdown_requested = shutdown.requested();
+    }
     loop {
         select! {
-            () = shutdown.requested() => return,
+            () = &mut shutdown_requested => break,
             _ = interval.tick() => {
                 let result = send(&query_tx, None, ping.clone(), timeout).await;
                 let mut reply = match result {

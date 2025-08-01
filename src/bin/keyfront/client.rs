@@ -19,7 +19,7 @@ use keyfront::{
 use std::sync::atomic;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    select,
+    pin, select,
 };
 use tokio_util::codec::FramedRead;
 use tracing::error;
@@ -89,9 +89,12 @@ impl<'a, B: Backend> Client<'a, B> {
             name: None,
             reply: BytesMut::new(),
         };
+        pin! {
+            let shutdown_requested = server.shutdown.requested();
+        }
         loop {
             select! {
-                () = server.shutdown.requested() => break,
+                () = &mut shutdown_requested => break,
                 result = stream.next() => {
                     let query = match result {
                         Some(Ok(query)) => query,
