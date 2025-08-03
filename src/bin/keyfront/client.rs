@@ -8,19 +8,17 @@ use crate::{
 };
 use bstr::ByteSlice;
 use bytes::{Buf, BytesMut};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use keyfront::{
     ByteBuf,
     cluster::Slot,
     commands::{COMMANDS, Command, CommandId, CommandName},
+    net::IntoSplit,
     reply::Section,
     resp::{ProtocolError, QueryDecoder, WriteResp},
 };
 use std::sync::atomic;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    pin, select,
-};
+use tokio::{io::AsyncWriteExt, pin, select};
 use tokio_util::codec::FramedRead;
 use tracing::error;
 
@@ -74,11 +72,8 @@ pub struct Client<'a, B> {
 }
 
 impl<'a, B: Backend> Client<'a, B> {
-    pub async fn run<R, W>(server: &'a Server<B>, reader: R, mut writer: W)
-    where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
-    {
+    pub async fn run<S: IntoSplit>(server: &'a Server<B>, stream: S) {
+        let (reader, mut writer) = stream.into_split();
         let decoder = QueryDecoder::new(server.config.proto_max_bulk_len);
         let mut stream = FramedRead::new(reader, decoder);
         let mut client = Self {

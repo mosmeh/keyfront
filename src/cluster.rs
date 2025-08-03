@@ -41,12 +41,17 @@ impl Node {
         self.0.addr
     }
 
-    pub fn generate_random_name() -> [u8; CLUSTER_NAMELEN] {
+    pub fn generate_random_name() -> Option<[u8; CLUSTER_NAMELEN]> {
         let mut name = [0; CLUSTER_NAMELEN];
+        tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+            .unwrap()
+            .secure_random
+            .fill(&mut name)
+            .ok()?;
         for x in &mut name {
-            *x = *fastrand::choice(b"0123456789abcdef").unwrap();
+            *x = b"0123456789abcdef"[usize::from(*x & 0xf)];
         }
-        name
+        Some(name)
     }
 }
 

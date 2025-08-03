@@ -11,7 +11,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSour
 use keyfront::{
     NonZeroMemorySize,
     cluster::{CLUSTER_SLOTS, Node},
-    net::{Address, Listener, ListenerKind, Socket},
+    net::{Address, IntoSplit, Listener, ListenerKind, Socket, TlsListener},
 };
 use serde::Deserialize;
 use std::{
@@ -32,6 +32,11 @@ use tokio::{
     pin, select,
     signal::unix::{SignalKind, signal},
     sync::{Semaphore, TryAcquireError},
+};
+use tokio_rustls::rustls::{
+    self, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    server::WebPkiClientVerifier,
 };
 use tokio_util::{
     sync::{CancellationToken, WaitForCancellationFuture},
@@ -95,6 +100,24 @@ config! {
     #[clap(default_value_t = defaults::proto_max_bulk_len())]
     proto_max_bulk_len: NonZeroMemorySize,
 
+    /// Enable TLS for client connections.
+    tls: bool,
+
+    /// Path to the TLS certificate file.
+    tls_cert_file: Option<PathBuf>,
+
+    /// Path to the TLS private key file.
+    tls_key_file: Option<PathBuf>,
+
+    /// Path to the TLS CA certificate file.
+    tls_ca_cert_file: Option<PathBuf>,
+
+    /// Whether to verify client certificates.
+    #[clap(default_value_t = defaults::tls_auth_clients())]
+    // `bool` is referred to as `std::primitive::bool` here to disable
+    // the default `action(ArgAction::SetTrue)`.
+    tls_auth_clients: std::primitive::bool,
+
     /// IP address and port to announce to clients and other nodes in the cluster.
     ///
     /// Defaults to the first IP address and port in the `bind` list,
@@ -157,6 +180,10 @@ mod defaults {
         NonZeroMemorySize::new(512 * 1024 * 1024).unwrap()
     }
 
+    pub fn tls_auth_clients() -> bool {
+        true
+    }
+
     pub fn backend_timeout() -> NonZeroU64 {
         NonZeroU64::new(10000).unwrap()
     }
@@ -177,6 +204,11 @@ impl Default for Config {
             backlog: defaults::backlog(),
             max_clients: defaults::max_clients(),
             proto_max_bulk_len: defaults::proto_max_bulk_len(),
+            tls: false,
+            tls_cert_file: None,
+            tls_key_file: None,
+            tls_ca_cert_file: None,
+            tls_auth_clients: false,
             announce: None,
             single_node: false,
             backend: None,
@@ -281,6 +313,26 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
+    if config.tls {
+        ensure!(
+            config.tls_cert_file.is_some() && config.tls_key_file.is_some(),
+            "tls-cert-file and tls-key-file must be specified when TLS is enabled"
+        );
+        if config.tls_auth_clients {
+            ensure!(
+                config.tls_ca_cert_file.is_some(),
+                "tls-ca-cert-file must be specified when tls-auth-clients is enabled"
+            );
+        }
+    }
+
+    ensure!(
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_ok(),
+        "Failed to install the default crypto provider for rustls"
+    );
+
     let shutdown = Shutdown::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -353,6 +405,29 @@ impl<B: Backend> Server<B> {
         tracker: &TaskTracker,
         shutdown: Shutdown,
     ) -> anyhow::Result<()> {
+        let tls_config = if config.tls {
+            let certs = CertificateDer::pem_file_iter(config.tls_cert_file.as_ref().unwrap())?
+                .collect::<Result<Vec<_>, _>>()?;
+            let key = PrivateKeyDer::from_pem_file(config.tls_key_file.as_ref().unwrap())?;
+            let server_config = ServerConfig::builder();
+            let server_config = if config.tls_auth_clients {
+                let ca_certs =
+                    CertificateDer::pem_file_iter(config.tls_ca_cert_file.as_ref().unwrap())?;
+                let mut cert_store = RootCertStore::empty();
+                for cert in ca_certs {
+                    cert_store.add(cert?)?;
+                }
+                let verifier = WebPkiClientVerifier::builder(Arc::new(cert_store)).build()?;
+                server_config.with_client_cert_verifier(verifier)
+            } else {
+                server_config.with_no_client_auth()
+            };
+            let server_config = server_config.with_single_cert(certs, key)?;
+            Some(Arc::new(server_config))
+        } else {
+            None
+        };
+
         let mut sockets = Vec::with_capacity(config.bind.len());
         let mut bound_addrs = Vec::with_capacity(config.bind.len());
         for bind in &config.bind {
@@ -361,7 +436,9 @@ impl<B: Backend> Server<B> {
             bound_addrs.push(addr);
         }
 
-        let node_name = Node::generate_random_name();
+        let Some(node_name) = Node::generate_random_name() else {
+            bail!("Failed to generate a random node name");
+        };
         info!("My node name is {}", node_name.as_bstr());
 
         let announced_addr = if let Some(addr) = config.announce {
@@ -408,12 +485,34 @@ impl<B: Backend> Server<B> {
         for listener in listeners {
             let server = server.clone();
             let shutdown = shutdown.clone();
-            match listener {
-                ListenerKind::Tcp(listener) => {
-                    tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+            if let Some(tls_config) = &tls_config {
+                let tls_config = tls_config.clone();
+                match listener {
+                    ListenerKind::Tcp(listener) => {
+                        tracker.spawn(run_accept_loop(
+                            TlsListener::new(listener, tls_config),
+                            server,
+                            tracker.clone(),
+                            shutdown,
+                        ));
+                    }
+                    ListenerKind::Unix(listener) => {
+                        tracker.spawn(run_accept_loop(
+                            TlsListener::new(listener, tls_config),
+                            server,
+                            tracker.clone(),
+                            shutdown,
+                        ));
+                    }
                 }
-                ListenerKind::Unix(listener) => {
-                    tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+            } else {
+                match listener {
+                    ListenerKind::Tcp(listener) => {
+                        tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+                    }
+                    ListenerKind::Unix(listener) => {
+                        tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+                    }
                 }
             }
         }
@@ -445,12 +544,13 @@ impl Shutdown {
 }
 
 async fn run_accept_loop<L, B>(
-    mut listener: L,
+    listener: L,
     server: Arc<Server<B>>,
     tracker: TaskTracker,
     shutdown: Shutdown,
 ) where
     L: Listener,
+    L::Stream: IntoSplit,
     B: Backend,
 {
     pin! {
@@ -460,7 +560,7 @@ async fn run_accept_loop<L, B>(
         select! {
             () = &mut shutdown_requested => break,
             result = listener.accept() => {
-                let (reader, mut writer) = match result {
+                let mut stream = match result {
                     Ok(stream) => stream,
                     Err(e) => {
                         warn!("Failed to accept connection: {e}");
@@ -472,7 +572,7 @@ async fn run_accept_loop<L, B>(
                     Ok(permit) => permit,
                     Err(TryAcquireError::Closed) => break,
                     Err(TryAcquireError::NoPermits) => {
-                        let _ = writer.write_all(b"-ERR max number of clients + cluster connections reached\r\n").await;
+                        let _ = stream.write_all(b"-ERR max number of clients + cluster connections reached\r\n").await;
                         server.stats.rejected_connections.fetch_add(1, atomic::Ordering::Relaxed);
                         continue;
                     }
@@ -482,7 +582,7 @@ async fn run_accept_loop<L, B>(
                     let server = server.clone();
                     async move {
                         let _permit = permit;
-                        Client::run(&server, reader, writer).await;
+                        Client::run(&server, stream).await;
                     }
                 });
 

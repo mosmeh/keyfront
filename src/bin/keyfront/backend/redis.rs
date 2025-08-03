@@ -8,11 +8,12 @@ use crate::{
 use anyhow::{anyhow, bail, ensure};
 use bstr::ByteSlice;
 use bytes::{Buf, Bytes, BytesMut};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use keyfront::{
     ByteBuf,
     cluster::{CLUSTER_SLOTS, Slot},
     commands::{Command, CommandId},
+    net::IntoSplit,
     query,
     reply::{Info, KeyspaceStats, ScanReply},
     resp::{ProtocolError, ReadResp, ReplyDecoder, WriteResp},
@@ -21,7 +22,7 @@ use keyfront::{
 };
 use std::{collections::VecDeque, str::FromStr, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpStream, UnixStream},
     pin, select,
     sync::{mpsc, oneshot},
@@ -50,15 +51,13 @@ impl RedisBackend {
             info!("Connecting to backend at {addr}");
             match addr {
                 Address::Tcp(addr) => {
-                    let backend = TcpStream::connect(addr).timeout(timeout).await??;
-                    backend.set_nodelay(true)?;
-                    let (reader, writer) = backend.into_split();
-                    tracker.spawn(run_multiplexer(reader, writer, query_rx, shutdown));
+                    let stream = TcpStream::connect(addr).timeout(timeout).await??;
+                    stream.set_nodelay(true)?;
+                    tracker.spawn(run_multiplexer(stream, query_rx, shutdown));
                 }
                 Address::Unix(path) => {
-                    let backend = UnixStream::connect(path).timeout(timeout).await??;
-                    let (reader, writer) = backend.into_split();
-                    tracker.spawn(run_multiplexer(reader, writer, query_rx, shutdown));
+                    let stream = UnixStream::connect(path).timeout(timeout).await??;
+                    tracker.spawn(run_multiplexer(stream, query_rx, shutdown));
                 }
             }
         }
@@ -432,15 +431,12 @@ enum PendingReply {
     ExpectOk,
 }
 
-async fn run_multiplexer<R, W>(
-    reader: R,
-    mut writer: W,
+async fn run_multiplexer<T: IntoSplit>(
+    stream: T,
     mut query_rx: mpsc::UnboundedReceiver<Query>,
     shutdown: Shutdown,
-) where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+) {
+    let (reader, mut writer) = stream.into_split();
     let mut stream = FramedRead::new(reader, ReplyDecoder::default());
     let mut query_buf = BytesMut::new();
     let mut selected_db = 0;
