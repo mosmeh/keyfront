@@ -19,9 +19,102 @@ jobs:
         toolchain: ${{ matrix.toolchain }}
         components: rustfmt, clippy
 
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
     - run: cargo build --verbose
     - run: cargo build --all-features --verbose
     - run: cargo test --verbose
     - run: cargo fmt --all -- --check
     - run: cargo clippy --all-targets -- -D warnings
     - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  valkey-test-redis-backend:
+    name: Valkey test (RedisBackend)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: valkey-test
+
+    - run: cargo build
+
+    - name: Cache Valkey build
+      id: cache-valkey-build
+      uses: actions/cache@v4
+      with:
+        path: valkey
+        key: valkey-${{ runner.os }}-${{ hashFiles('valkey/**') }}
+
+    - name: Build Valkey
+      if: steps.cache-valkey-build.outputs.cache-hit != 'true'
+      run: make -C valkey -j
+
+    - name: Start Valkey
+      run: utils/valkey-standalone &
+      env:
+        VALKEY_PATH: ${{ github.workspace }}/valkey/src/
+
+    - name: Wait until Valkey is ready
+      run: while ! valkey/src/valkey-cli -s valkey.sock -e ping; do sleep 1; done
+      timeout-minutes: 1
+
+    - name: Start Keyfront
+      run: cargo run -- --single-node --backend valkey.sock &
+
+    - name: Wait until Keyfront is ready
+      run: while ! nc -z 127.0.0.1 6379; do sleep 1; done
+      timeout-minutes: 1
+
+    - name: Run tests
+      run: utils/run-test --tags -slow
+      env:
+        BACKEND: redis
+      timeout-minutes: 5
+
+    - name: Shutdown Keyfront
+      run: echo shutdown | nc 127.0.0.1 6379
+
+    - name: Shutdown Valkey
+      run: valkey/src/valkey-cli -s valkey.sock -e shutdown
+
+  valkey-test-memory-backend:
+    name: Valkey test (MemoryBackend)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: valkey-test
+
+    - run: cargo build
+
+    - name: Start Keyfront
+      run: cargo run -- --single-node &
+
+    - name: Wait until Keyfront is ready
+      run: while ! nc -z 127.0.0.1 6379; do sleep 1; done
+      timeout-minutes: 1
+
+    - name: Run tests
+      run: utils/run-test --tags -slow
+      env:
+        BACKEND: memory
+      timeout-minutes: 5
+
+    - name: Shutdown Keyfront
+      run: echo shutdown | nc 127.0.0.1 6379

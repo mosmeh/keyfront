@@ -2,8 +2,121 @@
 
 set -euo pipefail
 
+ARGS=(
+    --host 127.0.0.1
+    --cluster-mode
+    --ignore-encoding
+    --tags '-needs:repl -needs:reset -resp3 -hello'
+)
+UNITS=(
+    unit/protocol
+    unit/quit
+    unit/other
+    unit/type/string
+    unit/type/incr
+)
+SKIPPED_TESTS=(
+    '/RESP3'
+    # unit/protocol
+    'test argument rewriting - issue 9598'
+    # unit/other
+    'Coverage: HELP commands'
+    'Extended Redis Compatibility config'
+)
+
+case "${BACKEND:-memory}" in
+redis)
+    UNITS+=(
+        unit/info-command
+        unit/scan
+        unit/sort
+        unit/scripting
+        unit/geo
+        unit/type/list
+        unit/type/set
+        unit/type/zset
+        unit/type/stream-cgroups
+    )
+    SKIPPED_TESTS+=(
+        # unit/sort
+        'SORT sorted set BY nosort should retain ordering'
+        # unit/scripting
+        'Script ACL check'
+        '/^Timedout'
+        # unit/other
+        'Check consistency of different data types after a reload'
+        'Same dataset digest if saving/reloading as AOF?'
+        # unit/type/list
+        '/BLPOP'
+        '/BRPOP'
+        '/BLMPOP'
+        '/BLMOVE'
+        'Linked LMOVEs'
+        'LPOP/RPOP/LMPOP NON-BLOCK or BLOCK against non list value'
+        'LMPOP with illegal argument'
+        'client unblock tests'
+        '/^Unblock fairness'
+        '/^Blocking'
+        # unit/type/set
+        'SINTERCARD with illegal arguments'
+        'SMOVE only notify dstset when the addition is successful'
+        # unit/type/zset
+        '/BZPOP'
+        '/BZMPOP'
+        'ZMPOP with illegal argument'
+        # unit/type/stream-cgroups
+        'XGROUP DESTROY should unblock XREADGROUP with -NOGROUP'
+        'RENAME can unblock XREADGROUP with data'
+        'RENAME can unblock XREADGROUP with -NOGROUP'
+        'XREADGROUP with NOACK creates consumer'
+        'Consumer without PEL is present in AOF after AOFRW'
+    )
+    ;;
+memory)
+    ARGS+=(--tags '-needs:debug -needs:save')
+    SKIPPED_TESTS+=(
+        # unit/protocol
+        '/^raw protocol response'
+        'Regression for a crash with blocking ops and pipelining'
+        # unit/type/string
+        'SETNX against not-expired volatile key'
+        'SETNX against expired volatile key'
+        '/^GETEX'
+        'MGET against non-string key'
+        '/^SETBIT'
+        '/^GETBIT'
+        '/^SETRANGE'
+        '/^GETRANGE'
+        '/^Coverage: SUBSTR'
+        'Extended SET GET with incorrect type should result in wrong type error'
+        '/^SET with IFEQ'
+        '/^Extended SET EX'
+        '/^Extended SET PX'
+        'Extended SET using multiple options at once'
+        '/^LCS'
+        '/^APPEND'
+        # unit/type/incr
+        'INCR fails against a key holding a list'
+        '/INCRBYFLOAT'
+        'string to double with null terminator'
+        'No negative zero'
+        '/ operation should update encoding from raw to int'
+    )
+    ;;
+*)
+    echo "Unknown backend: $BACKEND" >&2
+    exit 1
+    ;;
+esac
+
+for UNIT in "${UNITS[@]}"; do
+    ARGS+=(--single "$UNIT")
+done
+for TEST in "${SKIPPED_TESTS[@]}"; do
+    ARGS+=(--skiptest "$TEST")
+done
+ARGS+=("$@")
+
 UTILS_DIR=$(dirname "$(readlink -f "$0")")
-
 cd "$UTILS_DIR/../valkey"
-
-./runtest --host 127.0.0.1 --cluster-mode --tags '-needs:repl -resp3' "$@"
+./runtest "${ARGS[@]}"

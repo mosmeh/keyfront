@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use keyfront::{
     ByteBuf,
     cluster::{CLUSTER_SLOTS, Slot},
-    commands::{Command, CommandId},
+    commands::{Command, CommandId, FunctionCommand},
     reply::{Info, KeyspaceStats},
     resp::WriteResp,
     string::parse_int,
@@ -65,6 +65,7 @@ impl Backend for MemoryBackend {
             CommandId::Incrby => self.incrby(client, args),
             CommandId::Decr => self.decr(client, args),
             CommandId::Decrby => self.decrby(client, args),
+            CommandId::Function(c) => self.function(client, c),
             CommandId::Debug => self.debug(client, args),
             _ => Err(CommandError::Unimplemented),
         }
@@ -484,6 +485,20 @@ impl MemoryBackend {
         drop(map);
         client.reply_mut().write_integer(new_value);
         Ok(())
+    }
+
+    fn function(
+        &self,
+        client: &mut Client<'_, Self>,
+        command: FunctionCommand,
+    ) -> Result<(), CommandError> {
+        match command {
+            FunctionCommand::Flush => {
+                client.reply_mut().write_ok();
+                Ok(())
+            }
+            _ => Err(CommandError::Unimplemented),
+        }
     }
 
     fn debug(&self, client: &mut Client<'_, Self>, args: &[ByteBuf]) -> Result<(), CommandError> {
