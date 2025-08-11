@@ -5,7 +5,7 @@ use crate::{
     backend::{Backend, BackendError, COMPATIBLE_VERSION, SyncMode},
     client::{Client, CommandError},
 };
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{Context, bail, ensure};
 use bstr::ByteSlice;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -63,23 +63,16 @@ impl RedisBackend {
         }
 
         let info_reply = send(&query_tx, None, query!("INFO"), timeout).await?;
-        let Some(info) = Info::from_bytes(info_reply) else {
-            bail!("Failed to parse INFO reply")
-        };
+        let info = Info::from_bytes(info_reply).context("Failed to parse INFO reply")?;
 
-        let Some(version) = info
+        let version = info
             .section(Info::SERVER)
             .and_then(|section| section.get("redis_version"))
-        else {
-            bail!("Missing redis_version in INFO reply")
-        };
+            .context("Missing redis_version in INFO reply")?;
         info!("Backend version: Redis {}", version.as_bstr());
-        let Ok(version) = String::from_utf8(version.to_vec()) else {
-            bail!("Invalid characters in version")
-        };
-        let Some(parsed_version) = parse_version(&version) else {
-            bail!("Invalid version format")
-        };
+        let version =
+            String::from_utf8(version.to_vec()).context("Invalid characters in version")?;
+        let parsed_version = parse_version(&version).context("Invalid version format")?;
         let compatible_version = parse_version(COMPATIBLE_VERSION).unwrap();
         ensure!(
             parsed_version <= compatible_version,
@@ -108,9 +101,9 @@ impl RedisBackend {
         let role = backend.role().await?;
         ensure!(role == "master");
 
-        let Some(keyspace) = info.section(Info::KEYSPACE) else {
-            bail!("Missing keyspace section in INFO reply")
-        };
+        let keyspace = info
+            .section(Info::KEYSPACE)
+            .context("Missing keyspace section in INFO reply")?;
         let mut non_empty_dbs = 0usize;
         let mut total_keys = 0;
         for (db_id, stats) in keyspace.to_keyspace_stats() {
@@ -155,7 +148,7 @@ impl RedisBackend {
     async fn config_get<T>(&self, key: &str) -> anyhow::Result<T>
     where
         T: FromStr,
-        T::Err: std::fmt::Display,
+        T::Err: std::error::Error + Send + Sync + 'static,
     {
         let mut reply = self.raw_query(None, query!("CONFIG", "GET", key)).await?;
         match reply.read_array() {
@@ -169,13 +162,13 @@ impl RedisBackend {
         {
             bail!("Unexpected CONFIG GET reply key")
         }
-        let Some(value) = reply.read_bulk() else {
-            bail!("Missing value in CONFIG GET reply")
-        };
+        let value = reply
+            .read_bulk()
+            .context("Missing value in CONFIG GET reply")?;
         str::from_utf8(&value)
-            .map_err(|e| anyhow!("Invalid characters in CONFIG GET reply: {e}"))?
+            .context("Invalid characters in CONFIG GET reply")?
             .parse()
-            .map_err(|e| anyhow!("Failed to parse CONFIG GET reply: {e}"))
+            .context("Failed to parse CONFIG GET reply")
     }
 
     async fn role(&self) -> anyhow::Result<BytesMut> {
@@ -183,10 +176,9 @@ impl RedisBackend {
         if reply.read_array().is_none_or(|n| n == 0) {
             bail!("Unexpected array length in ROLE reply")
         }
-        let Some(role) = reply.read_bulk() else {
-            bail!("Missing an element in ROLE reply")
-        };
-        Ok(role)
+        reply
+            .read_bulk()
+            .context("Missing an element in ROLE reply")
     }
 }
 

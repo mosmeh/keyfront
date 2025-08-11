@@ -52,7 +52,7 @@ macro_rules! config {
         $(#[$meta:meta])*
         $field:ident: $ty:ty,
     )*) => {
-        #[derive(Clone, Parser, Deserialize)]
+        #[derive(Clone, Debug, Parser, Deserialize)]
         #[clap(version)]
         #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
         struct Config {
@@ -262,9 +262,9 @@ fn panic_hook(info: &PanicHookInfo) {
     let backtrace = Backtrace::capture();
 
     error!(
-        panic.payload = payload,
-        panic.location = location,
-        panic.backtrace = ?backtrace,
+        payload = payload,
+        location = location,
+        backtrace = ?backtrace,
         "A panic occurred",
     );
 }
@@ -272,11 +272,15 @@ fn panic_hook(info: &PanicHookInfo) {
 fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
 
-    let subscriber = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(tracing::Level::INFO.into())
-            .from_env()?,
-    );
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env()?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+        .with_file(true)
+        .with_line_number(true)
+        .with_env_filter(env_filter);
     if let Some(log_file) = &config.log_file {
         let file = OpenOptions::new()
             .create(true)
@@ -289,6 +293,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("Starting server");
+    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    info!("{config:?}");
+
     let mut runtime = if config.worker_threads > 0 {
         tokio::runtime::Builder::new_multi_thread()
     } else {
@@ -302,11 +309,16 @@ fn main() -> anyhow::Result<()> {
         .enable_time()
         .build()
         .map_err(Into::into)
-        .and_then(|runtime| runtime.block_on(run(config)));
+        .and_then(|runtime| runtime.block_on(run(config.clone())));
     match result {
         Ok(()) => {}
+        Err(e) if config.log_file.is_some() => error!(
+            backtrace = ?e.backtrace(),
+            "Server encountered an error: {:#}", e
+        ),
         Err(e) => error!("Server encountered an error: {:?}", e),
     }
+
     info!("Server stopped");
 
     Ok(())
