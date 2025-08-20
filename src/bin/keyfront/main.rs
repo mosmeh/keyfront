@@ -21,6 +21,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     panic::PanicHookInfo,
     path::PathBuf,
+    process::ExitCode,
     sync::{
         Arc, RwLock,
         atomic::{self, AtomicU64, AtomicUsize},
@@ -269,7 +270,7 @@ fn panic_hook(info: &PanicHookInfo) {
     );
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     let config = Config::load()?;
 
     let env_filter = tracing_subscriber::EnvFilter::builder()
@@ -310,18 +311,24 @@ fn main() -> anyhow::Result<()> {
         .build()
         .map_err(Into::into)
         .and_then(|runtime| runtime.block_on(run(config.clone())));
-    match result {
-        Ok(()) => {}
-        Err(e) if config.log_file.is_some() => error!(
-            backtrace = ?e.backtrace(),
-            "Server encountered an error: {:#}", e
-        ),
-        Err(e) => error!("Server encountered an error: {:?}", e),
-    }
+    let exit_code = match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if config.log_file.is_some() {
+                error!(
+                    backtrace = ?e.backtrace(),
+                    "Server encountered an error: {e:#}"
+                );
+            } else {
+                error!("Server encountered an error: {e:?}");
+            }
+            ExitCode::FAILURE
+        }
+    };
 
     info!("Server stopped");
 
-    Ok(())
+    Ok(exit_code)
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
