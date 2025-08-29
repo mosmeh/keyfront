@@ -40,7 +40,7 @@ use tokio_rustls::rustls::{
     server::WebPkiClientVerifier,
 };
 use tokio_util::{
-    sync::{CancellationToken, WaitForCancellationFuture},
+    sync::{CancellationToken, DropGuard},
     task::TaskTracker,
 };
 use tracing::{error, info, warn};
@@ -352,26 +352,36 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "Failed to install the default crypto provider for rustls"
     );
 
-    let shutdown = Shutdown::default();
+    let client_tasks = TaskGroup::default();
+    let background_tasks = TaskGroup::default();
+    // To trigger the shutdown, cancel client tasks first.
+    // Once all clients are disconnected, background tasks will be cancelled.
+    // This avoids cancelling essential background tasks while we are still
+    // serving clients.
+    let shutdown = Shutdown(client_tasks.cancel_token.clone());
+
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
+            let _shutdown_drop_guard = shutdown.drop_guard();
             select! {
                 _ = sigint.recv() => info!("Received SIGINT"),
                 _ = sigterm.recv() => info!("Received SIGTERM"),
             }
-            shutdown.request();
         }
     });
 
-    let tracker = TaskTracker::new();
-    let result = run_server(config.clone(), &tracker, shutdown.clone()).await;
+    let result = run_server(
+        config.clone(),
+        client_tasks.clone(),
+        background_tasks.clone(),
+        shutdown,
+    )
+    .await;
     info!("Shutting down server");
-    shutdown.request();
-    tracker.close();
-    tracker.wait().await;
+    client_tasks.cancel();
 
     for addr in &config.bind {
         if let Address::Unix(path) = addr
@@ -386,22 +396,27 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    client_tasks.wait_for_completion().await;
+    info!("All clients disconnected");
+    background_tasks.cancel();
+    background_tasks.wait_for_completion().await;
     result
 }
 
 async fn run_server(
     config: Config,
-    tracker: &TaskTracker,
+    client_tasks: TaskGroup,
+    background_tasks: TaskGroup,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     if let Some(addr) = &config.backend {
         info!("Initializing Redis backend");
-        let backend = RedisBackend::connect(addr, &config, tracker, shutdown.clone()).await?;
-        Server::run(config, backend, tracker, shutdown).await
+        let backend = RedisBackend::connect(addr, &config, background_tasks, &shutdown).await?;
+        Server::run(config, backend, client_tasks, shutdown).await
     } else {
         info!("Initializing in-memory backend");
         let backend = MemoryBackend::default();
-        Server::run(config, backend, tracker, shutdown).await
+        Server::run(config, backend, client_tasks, shutdown).await
     }
 }
 
@@ -413,6 +428,7 @@ struct Server<B> {
     this_node: Node,
     next_client_id: AtomicU64,
     clients_sem: Arc<Semaphore>,
+    client_tasks: TaskGroup,
     stats: Statistics,
     shutdown: Shutdown,
 }
@@ -421,7 +437,7 @@ impl<B: Backend> Server<B> {
     async fn run(
         config: Config,
         backend: B,
-        tracker: &TaskTracker,
+        client_tasks: TaskGroup,
         shutdown: Shutdown,
     ) -> anyhow::Result<()> {
         let tls_config = if config.tls {
@@ -497,46 +513,40 @@ impl<B: Backend> Server<B> {
             this_node,
             next_client_id: AtomicU64::new(1),
             clients_sem: clients_sem.clone(),
+            client_tasks: client_tasks.clone(),
             stats: Statistics::default(),
-            shutdown: shutdown.clone(),
+            shutdown,
         });
 
         for listener in listeners {
             let server = server.clone();
-            let shutdown = shutdown.clone();
             if let Some(tls_config) = &tls_config {
                 let tls_config = tls_config.clone();
                 match listener {
-                    ListenerKind::Tcp(listener) => {
-                        tracker.spawn(run_accept_loop(
-                            TlsListener::new(listener, tls_config),
-                            server,
-                            tracker.clone(),
-                            shutdown,
-                        ));
-                    }
-                    ListenerKind::Unix(listener) => {
-                        tracker.spawn(run_accept_loop(
-                            TlsListener::new(listener, tls_config),
-                            server,
-                            tracker.clone(),
-                            shutdown,
-                        ));
-                    }
+                    ListenerKind::Tcp(listener) => client_tasks.spawn(run_accept_loop(
+                        TlsListener::new(listener, tls_config),
+                        server,
+                        client_tasks.clone(),
+                    )),
+                    ListenerKind::Unix(listener) => client_tasks.spawn(run_accept_loop(
+                        TlsListener::new(listener, tls_config),
+                        server,
+                        client_tasks.clone(),
+                    )),
                 }
             } else {
                 match listener {
                     ListenerKind::Tcp(listener) => {
-                        tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+                        client_tasks.spawn(run_accept_loop(listener, server, client_tasks.clone()));
                     }
                     ListenerKind::Unix(listener) => {
-                        tracker.spawn(run_accept_loop(listener, server, tracker.clone(), shutdown));
+                        client_tasks.spawn(run_accept_loop(listener, server, client_tasks.clone()));
                     }
                 }
             }
         }
 
-        shutdown.requested().await;
+        client_tasks.cancelled().await;
         clients_sem.close();
         Ok(())
     }
@@ -550,6 +560,34 @@ struct Statistics {
 }
 
 #[derive(Clone, Default)]
+struct TaskGroup {
+    tracker: TaskTracker,
+    cancel_token: CancellationToken,
+}
+
+impl TaskGroup {
+    fn spawn<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tracker.spawn(f);
+    }
+
+    fn cancel(&self) {
+        self.cancel_token.cancel();
+        self.tracker.close();
+    }
+
+    async fn cancelled(&self) {
+        self.cancel_token.cancelled().await;
+    }
+
+    async fn wait_for_completion(&self) {
+        self.tracker.wait().await;
+    }
+}
+
+#[derive(Clone)]
 struct Shutdown(CancellationToken);
 
 impl Shutdown {
@@ -557,27 +595,23 @@ impl Shutdown {
         self.0.cancel();
     }
 
-    fn requested(&self) -> WaitForCancellationFuture<'_> {
-        self.0.cancelled()
+    fn drop_guard(&self) -> DropGuard {
+        self.0.clone().drop_guard()
     }
 }
 
-async fn run_accept_loop<L, B>(
-    listener: L,
-    server: Arc<Server<B>>,
-    tracker: TaskTracker,
-    shutdown: Shutdown,
-) where
+async fn run_accept_loop<L, B>(listener: L, server: Arc<Server<B>>, task_group: TaskGroup)
+where
     L: Listener,
     L::Stream: IntoSplit,
     B: Backend,
 {
     pin! {
-        let shutdown_requested = shutdown.requested();
+        let cancelled = task_group.cancelled();
     }
     loop {
         select! {
-            () = &mut shutdown_requested => break,
+            () = &mut cancelled => break,
             result = listener.accept() => {
                 let mut stream = match result {
                     Ok(stream) => stream,
@@ -597,7 +631,7 @@ async fn run_accept_loop<L, B>(
                     }
                 };
 
-                tracker.spawn({
+                task_group.spawn({
                     let server = server.clone();
                     async move {
                         let _permit = permit;

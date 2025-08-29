@@ -85,11 +85,11 @@ impl<'a, B: Backend> Client<'a, B> {
             reply: BytesMut::new(),
         };
         pin! {
-            let shutdown_requested = server.shutdown.requested();
+            let cancelled = server.client_tasks.cancelled();
         }
         loop {
             select! {
-                () = &mut shutdown_requested => break,
+                () = &mut cancelled => break,
                 result = stream.next() => {
                     let query = match result {
                         Some(Ok(query)) => query,
@@ -174,7 +174,6 @@ impl<'a, B: Backend> Client<'a, B> {
                 err.extend_from_slice(command.full_name.as_bytes());
                 append_args_to_error(args, &mut err);
                 self.reply.write_error(err);
-                return Ok(());
             }
             Err(CommandError::WrongArity) => write!(
                 self.reply,

@@ -1,7 +1,7 @@
 mod commands;
 
 use crate::{
-    Address, Config, Shutdown,
+    Address, Config, Shutdown, TaskGroup,
     backend::{Backend, BackendError, COMPATIBLE_VERSION, SyncMode},
     client::{Client, CommandError},
 };
@@ -27,7 +27,7 @@ use tokio::{
     pin, select,
     sync::{mpsc, oneshot},
 };
-use tokio_util::{codec::FramedRead, task::TaskTracker, time::FutureExt};
+use tokio_util::{codec::FramedRead, sync::DropGuard, time::FutureExt};
 use tracing::{error, info};
 
 pub struct RedisBackend {
@@ -40,24 +40,35 @@ impl RedisBackend {
     pub async fn connect(
         addr: &Address,
         config: &Config,
-        tracker: &TaskTracker,
-        shutdown: Shutdown,
+        task_group: TaskGroup,
+        shutdown: &Shutdown,
     ) -> anyhow::Result<Self> {
         let timeout = config.backend_timeout();
 
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         {
-            let shutdown = shutdown.clone();
+            let task_group = task_group.clone();
+            let shutdown_drop_guard = shutdown.drop_guard();
             info!("Connecting to backend at {addr}");
             match addr {
                 Address::Tcp(addr) => {
                     let stream = TcpStream::connect(addr).timeout(timeout).await??;
                     stream.set_nodelay(true)?;
-                    tracker.spawn(run_multiplexer(stream, query_rx, shutdown));
+                    task_group.spawn(run_multiplexer(
+                        stream,
+                        query_rx,
+                        task_group.clone(),
+                        shutdown_drop_guard,
+                    ));
                 }
                 Address::Unix(path) => {
                     let stream = UnixStream::connect(path).timeout(timeout).await??;
-                    tracker.spawn(run_multiplexer(stream, query_rx, shutdown));
+                    task_group.spawn(run_multiplexer(
+                        stream,
+                        query_rx,
+                        task_group.clone(),
+                        shutdown_drop_guard,
+                    ));
                 }
             }
         }
@@ -83,7 +94,8 @@ impl RedisBackend {
             query_tx.clone(),
             config.ping_interval(),
             timeout,
-            shutdown,
+            task_group,
+            shutdown.drop_guard(),
         ));
 
         let backend = Self {
@@ -426,7 +438,8 @@ enum PendingReply {
 async fn run_multiplexer<T: IntoSplit>(
     stream: T,
     mut query_rx: mpsc::UnboundedReceiver<Query>,
-    shutdown: Shutdown,
+    task_group: TaskGroup,
+    _shutdown_drop_guard: DropGuard,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut stream = FramedRead::new(reader, ReplyDecoder::default());
@@ -435,11 +448,11 @@ async fn run_multiplexer<T: IntoSplit>(
     let mut reply_queue = VecDeque::new();
     let mut itoa_buf = itoa::Buffer::new();
     pin! {
-        let shutdown_requested = shutdown.requested();
+        let cancelled = task_group.cancelled();
     }
     loop {
         select! {
-            () = &mut shutdown_requested => break,
+            () = &mut cancelled => break,
             result = writer.write_buf(&mut query_buf), if query_buf.has_remaining() => {
                 if let Err(e) = result {
                     error!("Failed to write to backend: {e}");
@@ -491,24 +504,24 @@ async fn run_multiplexer<T: IntoSplit>(
             },
         }
     }
-    shutdown.request();
 }
 
 async fn run_health_checker(
     query_tx: mpsc::UnboundedSender<Query>,
     ping_interval: Duration,
     timeout: Duration,
-    shutdown: Shutdown,
+    task_group: TaskGroup,
+    _shutdown_drop_guard: DropGuard,
 ) {
     let ping = query!("PING");
     let mut interval = tokio::time::interval(ping_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     pin! {
-        let shutdown_requested = shutdown.requested();
+        let cancelled = task_group.cancelled();
     }
     loop {
         select! {
-            () = &mut shutdown_requested => break,
+            () = &mut cancelled => break,
             _ = interval.tick() => {
                 let result = send(&query_tx, None, ping.clone(), timeout).await;
                 let mut reply = match result {
@@ -525,7 +538,6 @@ async fn run_health_checker(
             }
         }
     }
-    shutdown.request();
 }
 
 #[cfg(test)]
