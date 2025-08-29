@@ -86,7 +86,7 @@ macro_rules! config {
 config! {
     /// Listen for incoming connections on these addresses.
     /// This can be either an IP address and port, or a Unix socket path.
-    #[clap(default_values_t = defaults::bind())]
+    #[clap(default_values_t = defaults::bind(), value_delimiter = ',')]
     bind: Vec<Address>,
 
     /// `listen()` backlog.
@@ -101,16 +101,15 @@ config! {
     #[clap(default_value_t = defaults::proto_max_bulk_len())]
     proto_max_bulk_len: NonZeroMemorySize,
 
-    /// Enable TLS for client connections.
-    tls: bool,
-
-    /// Path to the TLS certificate file.
+    /// Path to the TLS certificate file for client connections.
+    /// If specified, TLS is enabled.
     tls_cert_file: Option<PathBuf>,
 
-    /// Path to the TLS private key file.
+    /// Path to the TLS private key file for client connections.
+    /// If specified, TLS is enabled.
     tls_key_file: Option<PathBuf>,
 
-    /// Path to the TLS CA certificate file.
+    /// Path to the TLS CA certificate file for client connections.
     tls_ca_cert_file: Option<PathBuf>,
 
     /// Whether to verify client certificates.
@@ -118,11 +117,6 @@ config! {
     // `bool` is referred to as `std::primitive::bool` here to disable
     // the default `action(ArgAction::SetTrue)`.
     tls_auth_clients: std::primitive::bool,
-
-    /// IP address and port to announce to clients and other nodes in the cluster.
-    ///
-    /// Defaults to the first IP address and port in the `bind` list,
-    announce: Option<SocketAddr>,
 
     /// Address of the backend Redis/Valkey server.
     /// This can be either an IP address and port, or a Unix socket path.
@@ -137,6 +131,44 @@ config! {
     /// Interval in milliseconds to ping the backend server.
     #[clap(default_value_t = defaults::ping_interval())]
     ping_interval: NonZeroU64,
+
+    /// IP address and port to announce to clients and other nodes in the cluster.
+    ///
+    /// Defaults to the first IP address and port in the `bind` list,
+    announce: Option<SocketAddr>,
+
+    /// Addresses of etcd servers to store cluster metadata.
+    ///
+    /// If not specified, the server will run as a single-node cluster.
+    #[clap(value_delimiter = ',')]
+    meta: Vec<String>,
+
+    /// Root path in etcd to store cluster metadata.
+    #[clap(default_value_t = defaults::meta_root())]
+    meta_root: String,
+
+    /// Path to the TLS certificate file for connections to etcd.
+    /// If specified, TLS is enabled.
+    etcd_tls_cert_file: Option<PathBuf>,
+
+    /// Path to the TLS private key file for connections to etcd.
+    /// If specified, TLS is enabled.
+    etcd_tls_key_file: Option<PathBuf>,
+
+    /// Path to the TLS CA certificate file for connections to etcd.
+    etcd_tls_ca_cert_file: Option<PathBuf>,
+
+    /// Timeout for connections to etcd in milliseconds.
+    #[clap(default_value_t = defaults::etcd_timeout())]
+    etcd_timeout: NonZeroU64,
+
+    /// TTL for leases in etcd in seconds.
+    #[clap(default_value_t = defaults::etcd_lease_ttl())]
+    etcd_lease_ttl: NonZeroU64,
+
+    /// Interval for keeping leases in etcd alive in milliseconds.
+    #[clap(default_value_t = defaults::etcd_lease_keep_alive_interval())]
+    etcd_lease_keep_alive_interval: NonZeroU64,
 
     /// Number of worker threads.
     #[clap(default_value_t = defaults::worker_threads())]
@@ -190,6 +222,22 @@ mod defaults {
         NonZeroU64::new(1000).unwrap()
     }
 
+    pub fn meta_root() -> String {
+        "/".to_owned()
+    }
+
+    pub fn etcd_timeout() -> NonZeroU64 {
+        NonZeroU64::new(10000).unwrap()
+    }
+
+    pub fn etcd_lease_ttl() -> NonZeroU64 {
+        NonZeroU64::new(3).unwrap()
+    }
+
+    pub fn etcd_lease_keep_alive_interval() -> NonZeroU64 {
+        NonZeroU64::new(500).unwrap()
+    }
+
     pub fn worker_threads() -> usize {
         0
     }
@@ -202,15 +250,22 @@ impl Default for Config {
             backlog: defaults::backlog(),
             max_clients: defaults::max_clients(),
             proto_max_bulk_len: defaults::proto_max_bulk_len(),
-            tls: false,
             tls_cert_file: None,
             tls_key_file: None,
             tls_ca_cert_file: None,
             tls_auth_clients: false,
-            announce: None,
             backend: None,
             backend_timeout: defaults::backend_timeout(),
             ping_interval: defaults::ping_interval(),
+            announce: None,
+            meta: Vec::new(),
+            meta_root: defaults::meta_root(),
+            etcd_tls_cert_file: None,
+            etcd_tls_key_file: None,
+            etcd_tls_ca_cert_file: None,
+            etcd_timeout: defaults::etcd_timeout(),
+            etcd_lease_ttl: defaults::etcd_lease_ttl(),
+            etcd_lease_keep_alive_interval: defaults::etcd_lease_keep_alive_interval(),
             worker_threads: defaults::worker_threads(),
             log_file: None,
             config_file: None,
@@ -219,12 +274,28 @@ impl Default for Config {
 }
 
 impl Config {
+    fn client_tls_enabled(&self) -> bool {
+        self.tls_cert_file.is_some() || self.tls_key_file.is_some()
+    }
+
     fn backend_timeout(&self) -> Duration {
         Duration::from_millis(self.backend_timeout.get())
     }
 
     fn ping_interval(&self) -> Duration {
         Duration::from_millis(self.ping_interval.get())
+    }
+
+    fn etcd_tls_enabled(&self) -> bool {
+        self.etcd_tls_cert_file.is_some() || self.etcd_tls_key_file.is_some()
+    }
+
+    fn etcd_timeout(&self) -> Duration {
+        Duration::from_millis(self.etcd_timeout.get())
+    }
+
+    fn etcd_lease_keep_alive_interval(&self) -> Duration {
+        Duration::from_millis(self.etcd_lease_keep_alive_interval.get())
     }
 
     fn load() -> anyhow::Result<Self> {
@@ -328,7 +399,7 @@ fn main() -> anyhow::Result<ExitCode> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    if config.tls {
+    if config.client_tls_enabled() {
         ensure!(
             config.tls_cert_file.is_some() && config.tls_key_file.is_some(),
             "tls-cert-file and tls-key-file must be specified when TLS is enabled"
@@ -342,7 +413,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     ensure!(
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .install_default()
             .is_ok(),
         "Failed to install the default crypto provider for rustls"
@@ -407,12 +478,13 @@ async fn run_server(
 ) -> anyhow::Result<()> {
     if let Some(addr) = &config.backend {
         info!("Initializing Redis backend");
-        let backend = RedisBackend::connect(addr, &config, background_tasks, &shutdown).await?;
-        Server::run(config, backend, client_tasks, shutdown).await
+        let backend =
+            RedisBackend::connect(addr, &config, background_tasks.clone(), &shutdown).await?;
+        Server::run(config, backend, client_tasks, background_tasks, shutdown).await
     } else {
         info!("Initializing in-memory backend");
         let backend = MemoryBackend::default();
-        Server::run(config, backend, client_tasks, shutdown).await
+        Server::run(config, backend, client_tasks, background_tasks, shutdown).await
     }
 }
 
@@ -433,9 +505,10 @@ impl<B: Backend> Server<B> {
         config: Config,
         backend: B,
         client_tasks: TaskGroup,
+        background_tasks: TaskGroup,
         shutdown: Shutdown,
     ) -> anyhow::Result<()> {
-        let tls_config = if config.tls {
+        let tls_config = if config.client_tls_enabled() {
             let certs = CertificateDer::pem_file_iter(config.tls_cert_file.as_ref().unwrap())?
                 .collect::<Result<Vec<_>, _>>()?;
             let key = PrivateKeyDer::from_pem_file(config.tls_key_file.as_ref().unwrap())?;
@@ -474,7 +547,8 @@ impl<B: Backend> Server<B> {
                 Address::Unix(_) => None,
             })
         });
-        let cluster = Cluster::connect(addr_to_announce)?;
+        let cluster =
+            Cluster::connect(&config, addr_to_announce, &background_tasks, &shutdown).await?;
 
         let mut listeners = Vec::with_capacity(sockets.len());
         for (socket, addr) in sockets.into_iter().zip(bound_addrs.iter()) {

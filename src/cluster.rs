@@ -1,5 +1,6 @@
 use crate::string::hex_digit_to_int;
 use bstr::ByteSlice;
+use serde::{Deserialize, Serialize, ser::SerializeSeq};
 use std::ops::{Index, IndexMut};
 
 const CLUSTER_NAMELEN: usize = 40;
@@ -57,10 +58,29 @@ impl std::fmt::Debug for NodeName {
     }
 }
 
+impl Serialize for NodeName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_hex().to_str().unwrap())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let hex: &str = Deserialize::deserialize(deserializer)?;
+        Self::from_hex(hex).ok_or_else(|| serde::de::Error::custom("invalid node name"))
+    }
+}
+
 pub const CLUSTER_SLOT_MASK_BITS: usize = 14;
 pub const CLUSTER_SLOTS: usize = 1 << CLUSTER_SLOT_MASK_BITS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot(u16);
 
 impl std::fmt::Display for Slot {
@@ -255,6 +275,102 @@ impl<T> SlotMap<T> {
 impl<T> SlotMap<Option<T>> {
     pub fn assigned_ranges(&self) -> SlotRanges<'_, T> {
         SlotRanges::new(self.iter())
+    }
+}
+
+/* Serialization format:
+{
+    "nodes": ["<node name>", "<node name>", ...],
+    "slots": [
+        null (unassigned) | <node index in "nodes" array>
+        ... (CLUSTER_SLOTS entries)
+    ]
+} */
+
+impl Serialize for SlotMap<Option<NodeName>> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Raw<'a> {
+            nodes: &'a [&'a NodeName],
+            slots: &'a Slots<'a>,
+        }
+
+        struct Slots<'a> {
+            slots: &'a [Option<NodeName>; CLUSTER_SLOTS],
+            nodes: &'a [&'a NodeName],
+        }
+
+        impl Serialize for Slots<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut seq = serializer.serialize_seq(Some(CLUSTER_SLOTS))?;
+                for slot in self.slots {
+                    let index = slot
+                        .as_ref()
+                        .map(|node| self.nodes.iter().position(|x| *x == node).unwrap());
+                    seq.serialize_element(&index)?;
+                }
+                seq.end()
+            }
+        }
+
+        let mut unique_nodes = Vec::new();
+        for node in self.0.iter().flatten() {
+            if !unique_nodes.contains(&node) {
+                unique_nodes.push(node);
+            }
+        }
+        Raw {
+            nodes: &unique_nodes,
+            slots: &Slots {
+                slots: &self.0,
+                nodes: &unique_nodes,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SlotMap<Option<NodeName>> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            slots: Vec<Option<usize>>,
+            nodes: Vec<NodeName>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.slots.len() != CLUSTER_SLOTS {
+            return Err(serde::de::Error::custom(format!(
+                "Expected {} slots, got {}",
+                CLUSTER_SLOTS,
+                raw.slots.len()
+            )));
+        }
+        let mut slots = Vec::with_capacity(CLUSTER_SLOTS);
+        for index in raw.slots {
+            let Some(index) = index else {
+                slots.push(None);
+                continue;
+            };
+            let Some(node) = raw.nodes.get(index) else {
+                return Err(serde::de::Error::custom(format!(
+                    "Node index out of range: got {}, but there are only {} nodes",
+                    index,
+                    raw.nodes.len()
+                )));
+            };
+            slots.push(Some(node.clone()));
+        }
+        Ok(Self(slots.try_into().unwrap()))
     }
 }
 

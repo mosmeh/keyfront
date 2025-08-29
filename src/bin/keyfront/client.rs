@@ -237,6 +237,8 @@ impl<'a, B: Backend> Client<'a, B> {
                     "    Return information about the server.",
                     "RELAY <command> [<arg> ...]",
                     "    Pass through a command to the backend server without intercepting it.",
+                    "RESIGN-LEADER",
+                    "    Resign from being the cluster leader.",
                     "HELP",
                     "    Print this help.",
                 ];
@@ -244,13 +246,11 @@ impl<'a, B: Backend> Client<'a, B> {
                 for line in LINES {
                     self.reply.write_simple(line);
                 }
-                Ok(())
             }
             [subcommand] if subcommand.eq_ignore_ascii_case(b"INFO") => {
                 let mut info = InfoSection::default();
                 info.insert("version", env!("CARGO_PKG_VERSION"));
                 self.reply.write_bulk(info.to_bytes());
-                Ok(())
             }
             [subcommand, args @ ..]
                 if subcommand.eq_ignore_ascii_case(b"RELAY") && !args.is_empty() =>
@@ -261,10 +261,16 @@ impl<'a, B: Backend> Client<'a, B> {
                     query.write_bulk(arg);
                 }
                 self.append_reply(self.server.backend.raw_query(None, query).await?);
-                Ok(())
             }
-            _ => Err(CommandError::Syntax),
+            [subcommand] if subcommand.eq_ignore_ascii_case(b"RESIGN-LEADER") => {
+                match self.server.cluster.resign_leader().await {
+                    Ok(()) => self.reply.write_ok(),
+                    Err(e) => write!(self.reply, "-ERR failed to resign leader: {e:#}"),
+                }
+            }
+            _ => return Err(CommandError::Syntax),
         }
+        Ok(())
     }
 }
 
