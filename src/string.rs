@@ -105,7 +105,7 @@ const fn is_space(ch: u8) -> bool {
     matches!(ch, b' ' | b'\n' | b'\r' | b'\t' | 0xb | 0xc)
 }
 
-fn hex_digit_to_int(ch: u8) -> u8 {
+pub fn hex_digit_to_int(ch: u8) -> u8 {
     match ch {
         b'0'..=b'9' => ch - b'0',
         b'a'..=b'f' => ch - b'a' + 10,

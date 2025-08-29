@@ -6,7 +6,7 @@ use bstr::ByteSlice;
 use bytes::BytesMut;
 use keyfront::{
     ByteBuf,
-    cluster::{CLUSTER_SLOTS, Slot},
+    cluster::{CLUSTER_SLOTS, Slot, SlotMap},
     commands::{Command, CommandId, FunctionCommand},
     reply::{Info, KeyspaceStats},
     resp::WriteResp,
@@ -21,19 +21,8 @@ use tracing::debug;
 
 type Map = HashMap<ByteBuf, ByteBuf>;
 
-pub struct MemoryBackend(Box<[RwLock<Map>; CLUSTER_SLOTS]>);
-
-impl Default for MemoryBackend {
-    fn default() -> Self {
-        Self(
-            (0..CLUSTER_SLOTS)
-                .map(|_| RwLock::default())
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-        )
-    }
-}
+#[derive(Default)]
+pub struct MemoryBackend(SlotMap<RwLock<Map>>);
 
 impl Backend for MemoryBackend {
     fn version(&self) -> &str {
@@ -594,18 +583,24 @@ impl MemoryBackend {
     }
 
     fn read(&self, slot: Slot) -> RwLockReadGuard<'_, Map> {
-        self.0[slot.index()].read().unwrap()
+        self.0[slot].read().unwrap()
     }
 
     fn read_all(&self) -> Vec<RwLockReadGuard<'_, Map>> {
-        self.0.iter().map(|lock| lock.read().unwrap()).collect()
+        self.0
+            .iter()
+            .map(|(_, lock)| lock.read().unwrap())
+            .collect()
     }
 
     fn write(&self, slot: Slot) -> RwLockWriteGuard<'_, Map> {
-        self.0[slot.index()].write().unwrap()
+        self.0[slot].write().unwrap()
     }
 
     fn write_all(&self) -> Vec<RwLockWriteGuard<'_, Map>> {
-        self.0.iter().map(|lock| lock.write().unwrap()).collect()
+        self.0
+            .iter()
+            .map(|(_, lock)| lock.write().unwrap())
+            .collect()
     }
 }

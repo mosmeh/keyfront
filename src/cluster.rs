@@ -1,57 +1,59 @@
+use crate::string::hex_digit_to_int;
 use bstr::ByteSlice;
-use std::{net::SocketAddr, sync::Arc};
+use std::ops::{Index, IndexMut};
 
 const CLUSTER_NAMELEN: usize = 40;
 
-#[derive(Clone)]
-pub struct Node(Arc<NodeInner>);
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeName([u8; CLUSTER_NAMELEN / 2]);
 
-struct NodeInner {
-    name: [u8; CLUSTER_NAMELEN],
-    addr: SocketAddr,
-}
-
-impl PartialEq for Node {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for Node {}
-
-impl std::fmt::Debug for Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Node")
-            .field("name", &self.0.name)
-            .field("addr", &self.0.addr)
-            .finish()
-    }
-}
-
-impl Node {
-    pub fn new(name: [u8; CLUSTER_NAMELEN], addr: SocketAddr) -> Self {
-        Self(Arc::new(NodeInner { name, addr }))
-    }
-
-    pub fn name(&self) -> &[u8; CLUSTER_NAMELEN] {
-        &self.0.name
-    }
-
-    pub fn addr(&self) -> SocketAddr {
-        self.0.addr
-    }
-
-    pub fn generate_random_name() -> Option<[u8; CLUSTER_NAMELEN]> {
-        let mut name = [0; CLUSTER_NAMELEN];
-        tokio_rustls::rustls::crypto::CryptoProvider::get_default()
-            .unwrap()
+impl NodeName {
+    pub fn generate_random() -> Option<Self> {
+        let mut bytes = [0; CLUSTER_NAMELEN / 2];
+        tokio_rustls::rustls::crypto::CryptoProvider::get_default()?
             .secure_random
-            .fill(&mut name)
-            .ok()?;
-        for x in &mut name {
-            *x = b"0123456789abcdef"[usize::from(*x & 0xf)];
+            .fill(&mut bytes)
+            .ok()
+            .map(|()| Self(bytes))
+    }
+
+    pub fn to_hex(&self) -> [u8; CLUSTER_NAMELEN] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = [0u8; CLUSTER_NAMELEN];
+        for (digit, &byte) in hex.chunks_exact_mut(2).zip(self.0.iter()) {
+            let [high, low] = digit else { unreachable!() };
+            *high = DIGITS[(byte >> 4) as usize];
+            *low = DIGITS[(byte & 0xf) as usize];
         }
-        Some(name)
+        hex
+    }
+
+    pub fn from_hex<T: AsRef<[u8]>>(hex: T) -> Option<Self> {
+        let hex = hex.as_ref();
+        if hex.len() != CLUSTER_NAMELEN {
+            return None;
+        }
+        let mut bytes = [0u8; CLUSTER_NAMELEN / 2];
+        for (byte, digits) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
+            let &[high, low] = digits else { unreachable!() };
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return None;
+            }
+            *byte = (hex_digit_to_int(high) << 4) | hex_digit_to_int(low);
+        }
+        Some(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for NodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_hex().as_bstr().fmt(f)
+    }
+}
+
+impl std::fmt::Debug for NodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_hex().as_bstr().fmt(f)
     }
 }
 
@@ -189,4 +191,113 @@ fn crc16(data: &[u8]) -> u16 {
         crc = (crc << 8) ^ CRC16_TAB[usize::from(((crc >> 8) ^ u16::from(byte)) & 0xff)];
     }
     crc
+}
+
+#[derive(Clone)]
+pub struct SlotMap<T>(Box<[T; CLUSTER_SLOTS]>);
+
+impl<T: Default> Default for SlotMap<T> {
+    fn default() -> Self {
+        Self::filled_with(|_| T::default())
+    }
+}
+
+impl<T> Index<Slot> for SlotMap<T> {
+    type Output = T;
+
+    fn index(&self, slot: Slot) -> &Self::Output {
+        &self.0[slot.index()]
+    }
+}
+
+impl<T> IndexMut<Slot> for SlotMap<T> {
+    fn index_mut(&mut self, slot: Slot) -> &mut Self::Output {
+        &mut self.0[slot.index()]
+    }
+}
+
+impl<T> SlotMap<T> {
+    pub fn filled(value: T) -> Self
+    where
+        T: Clone,
+    {
+        Self::filled_with(|_| value.clone())
+    }
+
+    pub fn filled_with<F>(mut f: F) -> Self
+    where
+        F: FnMut(Slot) -> T,
+    {
+        Self(
+            (0..CLUSTER_SLOTS)
+                .map(|i| f(Slot::new(i as u16).unwrap()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!()),
+        )
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Slot, &T)> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (Slot::new(i as u16).unwrap(), x))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Slot, &mut T)> {
+        self.0
+            .iter_mut()
+            .enumerate()
+            .map(|(i, x)| (Slot::new(i as u16).unwrap(), x))
+    }
+}
+
+impl<T> SlotMap<Option<T>> {
+    pub fn assigned_ranges(&self) -> SlotRanges<'_, T> {
+        SlotRanges::new(self.iter())
+    }
+}
+
+pub struct SlotRanges<'a, T> {
+    iter: Box<dyn Iterator<Item = (Slot, &'a Option<T>)> + 'a>,
+    range_start: Option<(Slot, &'a T)>,
+}
+
+impl<'a, T> SlotRanges<'a, T> {
+    pub fn new<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (Slot, &'a Option<T>)> + 'a,
+    {
+        Self {
+            iter: Box::new(iter.into_iter().fuse()),
+            range_start: None,
+        }
+    }
+}
+
+impl<'a, T> Iterator for SlotRanges<'a, T>
+where
+    T: PartialEq,
+{
+    type Item = (Slot, Slot, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (slot, node) in self.iter.by_ref() {
+            if node.as_ref() == self.range_start.map(|(_, prev_node)| prev_node) {
+                continue;
+            }
+            let next_range_start = node.as_ref().map(|x| (slot, x));
+            if let Some((start, prev_node)) = self.range_start {
+                let prev_slot = Slot::new(slot.get() - 1).unwrap();
+                let next_value = (start, prev_slot, prev_node);
+                self.range_start = next_range_start;
+                return Some(next_value);
+            }
+            self.range_start = next_range_start;
+        }
+        if let Some((start, node)) = self.range_start.take() {
+            return Some((start, Slot::new(Slot::MAX).unwrap(), node));
+        }
+        None
+    }
 }

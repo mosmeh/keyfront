@@ -295,18 +295,20 @@ impl<B> Client<'_, B> {
         let Some(slot) = Slot::from_keys(keys) else {
             return Err(CommandError::CrossSlot);
         };
-        let node = &self.server.slots.read().unwrap()[slot.index()];
-        match node {
-            Some(node) if node == &self.server.this_node => {}
-            Some(node) => {
-                return Err(CommandError::Moved {
-                    slot,
-                    addr: format!("{}:{}", node.addr().ip(), node.addr().port()).into(),
-                });
+        let cluster = &self.server.cluster;
+        let topology = cluster.topology();
+        if let Some(node_name) = topology.slot(slot) {
+            if node_name == cluster.this_node() {
+                return Ok(slot);
             }
-            None => return Err(CommandError::HashSlotNotServed),
+            let addr = *topology.node_addrs().get(node_name).unwrap();
+            drop(topology);
+            return Err(CommandError::Moved {
+                slot,
+                addr: format!("{}:{}", addr.ip(), addr.port()).into(),
+            });
         }
-        Ok(slot)
+        Err(CommandError::HashSlotNotServed)
     }
 
     #[expect(clippy::unnecessary_wraps)]

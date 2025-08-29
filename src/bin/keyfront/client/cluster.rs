@@ -2,18 +2,18 @@ use crate::{
     backend::{Backend, BackendError},
     client::{Client, CommandError},
 };
-use bstr::ByteSlice;
 use bytes::BytesMut;
 use keyfront::{
     ByteBuf,
-    cluster::{CLUSTER_SLOTS, Node, Slot},
+    cluster::{CLUSTER_SLOTS, Slot, SlotMap},
     commands::ClusterCommand,
     reply::Section,
     resp::WriteResp,
     string::parse_int,
 };
-use std::ops::Range;
+use std::collections::HashSet;
 
+#[expect(dead_code)]
 #[derive(Debug, thiserror::Error)]
 enum ClusterError {
     #[error(transparent)]
@@ -27,12 +27,6 @@ enum ClusterError {
 
     #[error("-ERR Slot {0} specified multiple times")]
     SlotSpecifiedMultipleTimes(u16),
-
-    #[error("-ERR Slot {0} is already busy")]
-    SlotAlreadyBusy(u16),
-
-    #[error("-ERR Slot {0} is already unassigned")]
-    SlotAlreadyUnassigned(u16),
 }
 
 impl From<BackendError> for ClusterError {
@@ -54,10 +48,6 @@ impl<B: Backend> Client<'_, B> {
             ClusterCommand::Nodes => self.cluster_nodes(),
             ClusterCommand::Slots => self.cluster_slots(),
             ClusterCommand::SlotStats => self.cluster_slot_stats(args).await,
-            ClusterCommand::Addslots => self.cluster_addslots(args),
-            ClusterCommand::Delslots => self.cluster_delslots(args),
-            ClusterCommand::Addslotsrange => self.cluster_addslotsrange(args),
-            ClusterCommand::Delslotsrange => self.cluster_delslotsrange(args),
             ClusterCommand::Keyslot => self.cluster_keyslot(args),
             ClusterCommand::Countkeysinslot => self.cluster_countkeysinslot(args).await,
             ClusterCommand::Getkeysinslot => self.cluster_getkeysinslot(args).await,
@@ -72,24 +62,27 @@ impl<B: Backend> Client<'_, B> {
     }
 
     fn cluster_info(&mut self) -> Result<(), ClusterError> {
-        let slots_assigned = self
-            .server
-            .slots
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|slot| slot.is_some())
-            .count();
+        let topology = self.server.cluster.topology();
+        let mut slots_assigned = 0usize;
+        let mut nodes_with_slots = HashSet::new();
+        for node_name in topology.slots().iter().filter_map(|(_, n)| n.as_ref()) {
+            slots_assigned += 1;
+            nodes_with_slots.insert(node_name);
+        }
+        let slots_ok = slots_assigned;
+        let known_nodes = topology.node_addrs().len();
+        let size = nodes_with_slots.len();
+        drop(topology);
+
         let mut itoa_buf = itoa::Buffer::new();
-        let slots_assigned = itoa_buf.format(slots_assigned);
         let mut info = Section::default();
         info.insert("cluster_state", "ok");
-        info.insert("cluster_slots_assigned", slots_assigned);
-        info.insert("cluster_slots_ok", slots_assigned);
+        info.insert("cluster_slots_assigned", itoa_buf.format(slots_assigned));
+        info.insert("cluster_slots_ok", itoa_buf.format(slots_ok));
         info.insert("cluster_slots_pfail", "0");
         info.insert("cluster_slots_fail", "0");
-        info.insert("cluster_known_nodes", "1");
-        info.insert("cluster_size", "1");
+        info.insert("cluster_known_nodes", itoa_buf.format(known_nodes));
+        info.insert("cluster_size", itoa_buf.format(size));
         info.insert("cluster_current_epoch", "0");
         info.insert("cluster_my_epoch", "0");
         self.reply.write_bulk(info.to_bytes());
@@ -97,53 +90,61 @@ impl<B: Backend> Client<'_, B> {
     }
 
     fn cluster_myid(&mut self) -> Result<(), ClusterError> {
-        self.reply.write_bulk(self.server.this_node.name());
+        let this_node = self.server.cluster.this_node();
+        self.reply.write_bulk(this_node.to_hex());
         Ok(())
     }
 
     fn cluster_nodes(&mut self) -> Result<(), ClusterError> {
-        let this_node = &self.server.this_node;
-        self.reply.write_bulk(format!(
-            "{} {}:{}@0 myself,master - 0 0 0 connected\n",
-            this_node.name().as_bstr(),
-            this_node.addr().ip(),
-            this_node.addr().port()
-        ));
+        let cluster = &self.server.cluster;
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut reply = Vec::new();
+        {
+            let topology = cluster.topology();
+            for (name, addr) in topology.node_addrs() {
+                reply.extend_from_slice(
+                    format!("{} {}:{}@0 ", name, addr.ip(), addr.port()).as_bytes(),
+                );
+                if name == cluster.this_node() {
+                    reply.extend_from_slice(b"myself,");
+                }
+                reply.extend_from_slice(b"master - 0 0 0 connected");
+                let slot_ranges = topology
+                    .slots()
+                    .assigned_ranges()
+                    .filter_map(|(start, end, n)| (n == name).then_some((start, end)));
+                for (start, end) in slot_ranges {
+                    reply.push(b' ');
+                    reply.extend_from_slice(itoa_buf.format(start.get()).as_bytes());
+                    if start != end {
+                        reply.push(b'-');
+                        reply.extend_from_slice(itoa_buf.format(end.get()).as_bytes());
+                    }
+                }
+                reply.push(b'\n');
+            }
+        }
+        self.reply.write_bulk(reply);
         Ok(())
     }
 
     fn cluster_slots(&mut self) -> Result<(), ClusterError> {
-        fn write_node(buf: &mut BytesMut, node: &Node, slot_range: Range<u16>) {
-            buf.write_array(3);
-            buf.write_integer(slot_range.start);
-            buf.write_integer(slot_range.end - 1);
-            buf.write_array(4);
-            buf.write_bulk(node.addr().ip().to_string());
-            buf.write_integer(node.addr().port());
-            buf.write_bulk(node.name());
-            buf.write_array(0);
-        }
-
         let mut buf = BytesMut::new();
         let mut num_items = 0;
-        let mut current = None;
         {
-            let slots = self.server.slots.read().unwrap();
-            for (slot, node) in slots.iter().enumerate() {
-                if node.as_ref() == current.as_ref().map(|(_, n)| n) {
-                    continue;
-                }
-                let slot = slot as u16;
-                if let Some((start_slot, node)) = current {
-                    write_node(&mut buf, &node, start_slot..slot);
-                    num_items += 1;
-                }
-                current = node.as_ref().map(|x| (slot, x.clone()));
+            let topology = self.server.cluster.topology();
+            for (start, end, node_name) in topology.slots().assigned_ranges() {
+                let addr = topology.node_addrs().get(node_name).unwrap();
+                buf.write_array(3);
+                buf.write_integer(start.get());
+                buf.write_integer(end.get());
+                buf.write_array(4);
+                buf.write_bulk(addr.ip().to_string());
+                buf.write_integer(addr.port());
+                buf.write_bulk(node_name.to_hex());
+                buf.write_array(0);
+                num_items += 1;
             }
-        }
-        if let Some((start_slot, node)) = current {
-            write_node(&mut buf, &node, start_slot..CLUSTER_SLOTS as u16);
-            num_items += 1;
         }
         self.reply.write_array(num_items);
         self.append_reply(buf);
@@ -252,113 +253,19 @@ impl<B: Backend> Client<'_, B> {
     }
 
     async fn slot_key_counts(&self) -> Result<Vec<(Slot, usize)>, BackendError> {
-        let mut key_counts: Box<[_; CLUSTER_SLOTS]> = vec![0; CLUSTER_SLOTS].try_into().unwrap();
+        let mut key_counts = SlotMap::filled(0);
         for (slot, stats) in self.server.backend.slot_stats().await? {
-            key_counts[slot.index()] = stats.keys;
+            key_counts[slot] = stats.keys;
         }
-        let key_counts = self
-            .server
-            .slots
-            .read()
-            .unwrap()
+        let cluster = &self.server.cluster;
+        let key_counts = cluster
+            .topology()
+            .slots()
             .iter()
-            .enumerate()
-            .filter(|&(_, node)| node.as_ref() == Some(&self.server.this_node))
-            .map(|(slot, _)| (Slot::new(slot as u16).unwrap(), key_counts[slot]))
+            .filter(|&(_, node_name)| node_name.as_ref() == Some(cluster.this_node()))
+            .map(|(slot, _)| (slot, key_counts[slot]))
             .collect();
         Ok(key_counts)
-    }
-
-    // CLUSTER ADDSLOTS slot [slot ...]
-    fn cluster_addslots(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        self.cluster_update_slots(args, true)
-    }
-
-    // CLUSTER DELSLOTS slot [slot ...]
-    fn cluster_delslots(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        self.cluster_update_slots(args, false)
-    }
-
-    fn cluster_update_slots(&mut self, args: &[ByteBuf], add: bool) -> Result<(), ClusterError> {
-        let mut is_slot_updated = [false; CLUSTER_SLOTS];
-        for arg in args {
-            let slot = parse_int(arg)
-                .and_then(Slot::new)
-                .ok_or(ClusterError::InvalidSlot)?;
-            if std::mem::replace(&mut is_slot_updated[slot.index()], true) {
-                return Err(ClusterError::SlotSpecifiedMultipleTimes(slot.get()));
-            }
-        }
-        self.update_slots(&is_slot_updated, add)?;
-        self.reply.write_ok();
-        Ok(())
-    }
-
-    // CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-    fn cluster_addslotsrange(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        self.cluster_update_slots_range(args, true)
-    }
-
-    // CLUSTER DELSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-    fn cluster_delslotsrange(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
-        self.cluster_update_slots_range(args, false)
-    }
-
-    fn cluster_update_slots_range(
-        &mut self,
-        args: &[ByteBuf],
-        add: bool,
-    ) -> Result<(), ClusterError> {
-        if !args.len().is_multiple_of(2) {
-            return Err(CommandError::WrongArity.into());
-        }
-        let mut updated_slots = [false; CLUSTER_SLOTS];
-        for slots in args.chunks_exact(2) {
-            let [start, end] = slots else {
-                unreachable!();
-            };
-            let start = parse_int(start)
-                .and_then(Slot::new)
-                .ok_or(ClusterError::InvalidSlot)?;
-            let end = parse_int(end)
-                .and_then(Slot::new)
-                .ok_or(ClusterError::InvalidSlot)?;
-            if start > end {
-                return Err(ClusterError::StartGreaterThanEnd { start, end });
-            }
-            for slot in start.get()..=end.get() {
-                if std::mem::replace(&mut updated_slots[usize::from(slot)], true) {
-                    return Err(ClusterError::SlotSpecifiedMultipleTimes(slot));
-                }
-            }
-        }
-        self.update_slots(&updated_slots, add)?;
-        self.reply.write_ok();
-        Ok(())
-    }
-
-    fn update_slots(
-        &self,
-        updated_slots: &[bool; CLUSTER_SLOTS],
-        add: bool,
-    ) -> Result<(), ClusterError> {
-        let mut slots = self.server.slots.write().unwrap();
-        for (slot, update) in updated_slots.iter().enumerate() {
-            if !*update {
-                continue;
-            }
-            if add && slots[slot].is_some() {
-                return Err(ClusterError::SlotAlreadyBusy(slot as u16));
-            } else if !add && slots[slot].is_none() {
-                return Err(ClusterError::SlotAlreadyUnassigned(slot as u16));
-            }
-        }
-        for (slot, update) in updated_slots.iter().enumerate() {
-            if *update {
-                slots[slot] = add.then(|| self.server.this_node.clone());
-            }
-        }
-        Ok(())
     }
 
     // CLUSTER KEYSLOT key

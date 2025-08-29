@@ -68,7 +68,7 @@ jobs:
       timeout-minutes: 1
 
     - name: Start Keyfront
-      run: cargo run -- --single-node --backend valkey.sock &
+      run: cargo run -- --backend valkey.sock &
 
     - name: Wait until Keyfront is ready
       run: while ! nc -z 127.0.0.1 6379; do sleep 1; done
@@ -104,7 +104,7 @@ jobs:
     - run: cargo build
 
     - name: Start Keyfront
-      run: cargo run -- --single-node &
+      run: cargo run &
 
     - name: Wait until Keyfront is ready
       run: while ! nc -z 127.0.0.1 6379; do sleep 1; done

@@ -1,29 +1,29 @@
 mod backend;
 mod client;
+mod cluster;
 
 use crate::{
     backend::{Backend, MemoryBackend, RedisBackend},
     client::Client,
+    cluster::Cluster,
 };
-use anyhow::{bail, ensure};
-use bstr::ByteSlice;
+use anyhow::ensure;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use keyfront::{
     NonZeroMemorySize,
-    cluster::{CLUSTER_SLOTS, Node},
     net::{Address, IntoSplit, Listener, ListenerKind, Socket, TlsListener},
 };
 use serde::Deserialize;
 use std::{
     backtrace::Backtrace,
     fs::OpenOptions,
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     num::{NonZeroU64, NonZeroUsize},
     panic::PanicHookInfo,
     path::PathBuf,
     process::ExitCode,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{self, AtomicU64, AtomicUsize},
     },
     time::Duration,
@@ -124,9 +124,6 @@ config! {
     /// Defaults to the first IP address and port in the `bind` list,
     announce: Option<SocketAddr>,
 
-    /// Run in single-node mode.
-    single_node: bool,
-
     /// Address of the backend Redis/Valkey server.
     /// This can be either an IP address and port, or a Unix socket path.
     ///
@@ -211,7 +208,6 @@ impl Default for Config {
             tls_ca_cert_file: None,
             tls_auth_clients: false,
             announce: None,
-            single_node: false,
             backend: None,
             backend_timeout: defaults::backend_timeout(),
             ping_interval: defaults::ping_interval(),
@@ -422,10 +418,9 @@ async fn run_server(
 
 struct Server<B> {
     config: Config,
-    bound_addrs: Vec<Address>,
     backend: B,
-    slots: RwLock<Box<[Option<Node>; CLUSTER_SLOTS]>>,
-    this_node: Node,
+    cluster: Cluster,
+    bound_addrs: Vec<Address>,
     next_client_id: AtomicU64,
     clients_sem: Arc<Semaphore>,
     client_tasks: TaskGroup,
@@ -463,6 +458,8 @@ impl<B: Backend> Server<B> {
             None
         };
 
+        let clients_sem = Arc::new(Semaphore::new(config.max_clients.get()));
+
         let mut sockets = Vec::with_capacity(config.bind.len());
         let mut bound_addrs = Vec::with_capacity(config.bind.len());
         for bind in &config.bind {
@@ -471,33 +468,13 @@ impl<B: Backend> Server<B> {
             bound_addrs.push(addr);
         }
 
-        let Some(node_name) = Node::generate_random_name() else {
-            bail!("Failed to generate a random node name");
-        };
-        info!("My node name is {}", node_name.as_bstr());
-
-        let announced_addr = if let Some(addr) = config.announce {
-            addr
-        } else if let Some(addr) = bound_addrs.iter().find_map(|addr| match addr {
-            Address::Tcp(addr) => Some(*addr),
-            Address::Unix(_) => None,
-        }) {
-            addr
-        } else if config.single_node {
-            // No one actually cares about this address, so just use a dummy address.
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            bail!("No TCP bind address specified, and no announce address provided");
-        };
-        let this_node = Node::new(node_name, announced_addr);
-
-        let assigned_node = config.single_node.then(|| {
-            info!("Running in single-node mode. All slots will be assigned to this node.");
-            this_node.clone()
+        let addr_to_announce = config.announce.or_else(|| {
+            bound_addrs.iter().find_map(|addr| match addr {
+                Address::Tcp(addr) => Some(*addr),
+                Address::Unix(_) => None,
+            })
         });
-        let slots = RwLock::new(vec![assigned_node; CLUSTER_SLOTS].try_into().unwrap());
-
-        let clients_sem = Arc::new(Semaphore::new(config.max_clients.get()));
+        let cluster = Cluster::connect(addr_to_announce)?;
 
         let mut listeners = Vec::with_capacity(sockets.len());
         for (socket, addr) in sockets.into_iter().zip(bound_addrs.iter()) {
@@ -507,10 +484,9 @@ impl<B: Backend> Server<B> {
 
         let server = Arc::new(Self {
             config,
-            bound_addrs,
             backend,
-            slots,
-            this_node,
+            cluster,
+            bound_addrs,
             next_client_id: AtomicU64::new(1),
             clients_sem: clients_sem.clone(),
             client_tasks: client_tasks.clone(),
