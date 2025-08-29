@@ -7,7 +7,7 @@ use keyfront::{
     ByteBuf,
     cluster::{CLUSTER_SLOTS, Slot, SlotMap},
     commands::ClusterCommand,
-    reply::Section,
+    reply::InfoSection,
     resp::WriteResp,
     string::parse_int,
 };
@@ -75,7 +75,7 @@ impl<B: Backend> Client<'_, B> {
         drop(topology);
 
         let mut itoa_buf = itoa::Buffer::new();
-        let mut info = Section::default();
+        let mut info = InfoSection::default();
         info.insert("cluster_state", "ok");
         info.insert("cluster_slots_assigned", itoa_buf.format(slots_assigned));
         info.insert("cluster_slots_ok", itoa_buf.format(slots_ok));

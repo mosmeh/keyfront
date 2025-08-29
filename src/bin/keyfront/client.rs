@@ -14,7 +14,7 @@ use keyfront::{
     cluster::Slot,
     commands::{COMMANDS, Command, CommandId, CommandName},
     net::IntoSplit,
-    reply::Section,
+    reply::InfoSection,
     resp::{ProtocolError, QueryDecoder, WriteResp},
 };
 use std::sync::atomic;
@@ -247,7 +247,7 @@ impl<'a, B: Backend> Client<'a, B> {
                 Ok(())
             }
             [subcommand] if subcommand.eq_ignore_ascii_case(b"INFO") => {
-                let mut info = Section::default();
+                let mut info = InfoSection::default();
                 info.insert("version", env!("CARGO_PKG_VERSION"));
                 self.reply.write_bulk(info.to_bytes());
                 Ok(())

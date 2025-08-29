@@ -6,7 +6,7 @@ use std::num::Saturating;
 const CRLF: &[u8] = b"\r\n";
 
 #[derive(Default)]
-pub struct Info(Vec<(ByteBuf, Section)>);
+pub struct Info(Vec<(ByteBuf, InfoSection)>);
 
 impl Info {
     pub const SERVER: &'static [u8] = b"server";
@@ -24,7 +24,7 @@ impl Info {
                 continue;
             }
             if let Some(name) = line.strip_prefix(b"# ") {
-                if let Some(section) = section.replace((name.into(), Section(Vec::new()))) {
+                if let Some(section) = section.replace((name.into(), InfoSection(Vec::new()))) {
                     sections.push(section);
                 }
                 continue;
@@ -52,26 +52,26 @@ impl Info {
             bytes.put_slice(b"# ");
             bytes.put_slice(name);
             bytes.put_slice(CRLF);
-            bytes.put_slice(&section.to_bytes());
+            bytes.unsplit(section.to_bytes());
         }
         bytes
     }
 
-    pub fn section<T: AsRef<[u8]>>(&self, name: T) -> Option<&Section> {
+    pub fn section<T: AsRef<[u8]>>(&self, name: T) -> Option<&InfoSection> {
         let needle = name.as_ref();
         self.0
             .iter()
             .find_map(|(n, section)| n.eq_ignore_ascii_case(needle).then_some(section))
     }
 
-    pub fn section_mut<T: AsRef<[u8]>>(&mut self, name: T) -> Option<&mut Section> {
+    pub fn section_mut<T: AsRef<[u8]>>(&mut self, name: T) -> Option<&mut InfoSection> {
         let needle = name.as_ref();
         self.0
             .iter_mut()
             .find_map(|(n, section)| n.eq_ignore_ascii_case(needle).then_some(section))
     }
 
-    pub fn insert_section<T: AsRef<[u8]>>(&mut self, name: T) -> Option<Section> {
+    pub fn insert_section<T: AsRef<[u8]>>(&mut self, name: T) -> Option<InfoSection> {
         let needle = name.as_ref();
         if let Some((_, section)) = self
             .0
@@ -80,16 +80,16 @@ impl Info {
         {
             Some(std::mem::take(section))
         } else {
-            self.0.push((needle.into(), Section::default()));
+            self.0.push((needle.into(), InfoSection::default()));
             None
         }
     }
 }
 
 #[derive(Default)]
-pub struct Section(Vec<(ByteBuf, ByteBuf)>);
+pub struct InfoSection(Vec<(ByteBuf, ByteBuf)>);
 
-impl Section {
+impl InfoSection {
     pub fn to_bytes(&self) -> BytesMut {
         let mut bytes = BytesMut::new();
         for (key, value) in &self.0 {
