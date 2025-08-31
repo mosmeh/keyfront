@@ -1,17 +1,17 @@
 use crate::{
     TaskGroup,
-    cluster::{Lease, Request, Topology},
+    cluster::{Lease, Request, Topology, assignment},
 };
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, anyhow, bail, ensure};
 use bstr::ByteSlice;
 use etcd_client::{
-    EventType, GetOptions, KeyValue, LeaderKey, LeaderResponse, ObserveStream, ResignOptions,
-    WatchResponse, WatchStream,
+    Compare, CompareOp, EventType, GetOptions, KeyValue, LeaderKey, LeaderResponse, ObserveStream,
+    ResignOptions, Txn, TxnOp, TxnResponse, WatchResponse, WatchStream,
 };
 use futures_util::{FutureExt, Stream, StreamExt};
-use keyfront::cluster::NodeName;
+use keyfront::cluster::{NodeName, Slot};
 use std::{
-    collections::hash_map::Entry,
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -163,6 +163,7 @@ impl StateMachine {
 
         // Remove assignments to nodes that have left the cluster.
         // This will avoid -MOVED redirection to non-existent nodes.
+        // The leader will assign these slots to the remaining nodes.
         for (_, maybe_node) in slots.iter_mut() {
             if let Some(node) = maybe_node
                 && !node_addrs.contains_key(node)
@@ -192,6 +193,17 @@ impl Leader {
         }
         loop {
             ensure!(ctx.lease.is_alive(), "Lease expired");
+
+            let assignments = assignment::assign_unassigned_slots(&ctx.topology.read().unwrap());
+            if !assignments.is_empty() {
+                info!("Assigning unassigned slots");
+
+                // Propagate the error even if it is LeaderError::NonFatal,
+                // because not being able to assign unassigned slots is
+                // a critical problem.
+                self.assign_slots(ctx, &assignments).await?;
+            }
+
             select! {
                 () = &mut cancelled => {
                     self.resign(ctx).await?;
@@ -225,7 +237,6 @@ impl Leader {
         ctx: &StateMachine,
         request: Request,
     ) -> anyhow::Result<Option<State>> {
-        #[expect(clippy::unnecessary_wraps)]
         fn handle_result<T: Clone>(
             result: Result<T, LeaderError>,
             response_tx: oneshot::Sender<anyhow::Result<T>>,
@@ -239,11 +250,26 @@ impl Leader {
                     let _ = response_tx.send(Err(e));
                     Ok(Err(()))
                 }
+                Err(e) => Err(e.into()),
             }
         }
 
         ensure!(ctx.lease.is_alive(), "Lease expired");
         match request {
+            Request::AssignSlots {
+                slots,
+                node,
+                response_tx,
+            } => {
+                let result = self
+                    .assign_slots(ctx, &HashMap::from([(node, slots)]))
+                    .await;
+                let _ = handle_result(result, response_tx)?;
+            }
+            Request::RebalanceSlots(response_tx) => {
+                let result = self.rebalance_slots(ctx).await;
+                let _ = handle_result(result, response_tx)?;
+            }
             Request::ResignLeader(response_tx) => {
                 let result = handle_result(self.resign(ctx).await, response_tx)?;
                 if result.is_ok() {
@@ -252,6 +278,65 @@ impl Leader {
             }
         }
         Ok(None)
+    }
+
+    async fn assign_slots(
+        &self,
+        ctx: &StateMachine,
+        assignments: &HashMap<NodeName, HashSet<Slot>>,
+    ) -> Result<(), LeaderError> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+
+        let mut unique_slots = HashSet::new();
+        let mut num_changed_slots = 0;
+        let mut num_changed_nodes = 0;
+        let new_slots = {
+            let topology = ctx.topology.read().unwrap();
+            let mut new_slots = topology.slots.clone();
+            for (node, slots) in assignments {
+                if !topology.node_addrs.contains_key(node) {
+                    return Err(anyhow!("Node {node} not found in cluster").into());
+                }
+                let mut changed_node = false;
+                for slot in slots {
+                    if !unique_slots.insert(slot) {
+                        return Err(anyhow!("Slot {slot} specified multiple times").into());
+                    }
+                    let prev = new_slots[*slot].replace(node.clone());
+                    if prev.as_ref() != Some(node) {
+                        num_changed_slots += 1;
+                        changed_node = true;
+                    }
+                }
+                if changed_node {
+                    num_changed_nodes += 1;
+                }
+            }
+            new_slots
+        };
+        if num_changed_slots == 0 {
+            return Ok(());
+        }
+        info!("Reassigning {num_changed_slots} slots to {num_changed_nodes} nodes");
+
+        let serialized_slots =
+            serde_json::to_vec(&new_slots).context("Failed to serialize slot map")?;
+        let put = TxnOp::put(ctx.prefix_with_root(SLOTS_PATH), serialized_slots, None);
+        self.txn_if_leader(ctx, [put]).await?;
+        ctx.topology.write().unwrap().slots = new_slots;
+        Ok(())
+    }
+
+    async fn rebalance_slots(&self, ctx: &StateMachine) -> Result<(), LeaderError> {
+        let assignments = assignment::rebalance_slots(&ctx.topology.read().unwrap());
+        if assignments.is_empty() {
+            info!("Attempted to rebalance slots, but all slots are already balanced");
+            return Ok(());
+        }
+        info!("Rebalancing slots");
+        self.assign_slots(ctx, &assignments).await
     }
 
     async fn resign(&self, ctx: &StateMachine) -> Result<(), LeaderError> {
@@ -274,12 +359,36 @@ impl Leader {
             }
         }
     }
+
+    /// Performs a transaction only if this node is still the leader.
+    async fn txn_if_leader(
+        &self,
+        ctx: &StateMachine,
+        ops: impl Into<Vec<TxnOp>>,
+    ) -> Result<TxnResponse, LeaderError> {
+        let txn = Txn::new()
+            .when([Compare::create_revision(
+                self.leader_key.key(),
+                CompareOp::Equal,
+                self.leader_key.rev(),
+            )])
+            .and_then(ops);
+        let response = ctx.etcd.kv_client().txn(txn).await?;
+        if response.succeeded() {
+            Ok(response)
+        } else {
+            Err(LeaderError::LostLeadership)
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 enum LeaderError {
     #[error(transparent)]
     NonFatal(#[from] anyhow::Error),
+
+    #[error("Lost leadership")]
+    LostLeadership,
 }
 
 impl From<etcd_client::Error> for LeaderError {
@@ -358,7 +467,9 @@ impl Follower {
                 }
                 Some(request) = ctx.request_rx.recv() => {
                     match request {
-                        Request::ResignLeader(response_tx) => {
+                        Request::AssignSlots { response_tx, .. }
+                        | Request::RebalanceSlots(response_tx)
+                        | Request::ResignLeader(response_tx) => {
                             let _ = response_tx.send(Err(anyhow::Error::msg("I'm not a leader")));
                         }
                     }

@@ -5,19 +5,21 @@ mod server;
 use crate::{
     Server,
     backend::{Backend, BackendError},
+    client::cluster::ClusterError,
 };
 use bstr::ByteSlice;
 use bytes::{Buf, BytesMut};
 use futures_util::StreamExt;
 use keyfront::{
     ByteBuf,
-    cluster::Slot,
+    cluster::{NodeName, Slot},
     commands::{COMMANDS, Command, CommandId, CommandName},
     net::IntoSplit,
     reply::InfoSection,
     resp::{ProtocolError, QueryDecoder, WriteResp},
+    string::parse_int,
 };
-use std::sync::atomic;
+use std::{collections::HashSet, sync::atomic};
 use tokio::{io::AsyncWriteExt, pin, select};
 use tokio_util::codec::FramedRead;
 use tracing::error;
@@ -237,6 +239,10 @@ impl<'a, B: Backend> Client<'a, B> {
                     "    Return information about the server.",
                     "RELAY <command> [<arg> ...]",
                     "    Pass through a command to the backend server without intercepting it.",
+                    "SLOT ASSIGN SLOTSRANGE <start-slot> <end-slot> [<start-slot> <end-slot> ...] NODE <node-id>",
+                    "    Assign slots to a node.",
+                    "SLOT REBALANCE",
+                    "    Rebalance slots among nodes.",
                     "RESIGN-LEADER",
                     "    Resign from being the cluster leader.",
                     "HELP",
@@ -262,6 +268,14 @@ impl<'a, B: Backend> Client<'a, B> {
                 }
                 self.append_reply(self.server.backend.raw_query(None, query).await?);
             }
+            [subcommand, opts @ ..] if subcommand.eq_ignore_ascii_case(b"SLOT") => {
+                let result = self.keyfront_slot(opts).await;
+                match result {
+                    Ok(()) => {}
+                    Err(ClusterError::Command(e)) => return Err(e),
+                    Err(e) => self.reply.write_error(e.to_string()),
+                }
+            }
             [subcommand] if subcommand.eq_ignore_ascii_case(b"RESIGN-LEADER") => {
                 match self.server.cluster.resign_leader().await {
                     Ok(()) => self.reply.write_ok(),
@@ -269,6 +283,75 @@ impl<'a, B: Backend> Client<'a, B> {
                 }
             }
             _ => return Err(CommandError::Syntax),
+        }
+        Ok(())
+    }
+
+    async fn keyfront_slot(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
+        match args {
+            [subcommand, opts @ ..] if subcommand.eq_ignore_ascii_case(b"ASSIGN") => {
+                let mut node = None;
+                let mut slots = HashSet::new();
+                let mut opts = opts;
+                loop {
+                    match opts {
+                        [] => break,
+                        [opt, rest @ ..] if opt.eq_ignore_ascii_case(b"SLOTSRANGE") => {
+                            opts = rest;
+                            while let [start, end, rest @ ..] = opts {
+                                let Some(start) = parse_int(start) else {
+                                    // SLOTSRANGE arguments list finished
+                                    break;
+                                };
+                                let start = Slot::new(start).ok_or(ClusterError::InvalidSlot)?;
+                                let end = parse_int(end)
+                                    .and_then(Slot::new)
+                                    .ok_or(ClusterError::InvalidSlot)?;
+                                if start > end {
+                                    return Err(ClusterError::StartGreaterThanEnd { start, end });
+                                }
+                                for slot in start.get()..=end.get() {
+                                    if !slots.insert(Slot::new(slot).unwrap()) {
+                                        return Err(ClusterError::SlotSpecifiedMultipleTimes(slot));
+                                    }
+                                }
+                                opts = rest;
+                            }
+                        }
+                        [opt, node_name, rest @ ..]
+                            if opt.eq_ignore_ascii_case(b"NODE") && node.is_none() =>
+                        {
+                            let Some(node_name) = NodeName::from_hex(node_name.as_ref()) else {
+                                write!(
+                                    self.reply,
+                                    "-ERR Invalid node name: {}",
+                                    node_name.as_bstr()
+                                );
+                                return Ok(());
+                            };
+                            node = Some(node_name);
+                            opts = rest;
+                        }
+                        _ => return Err(CommandError::Syntax.into()),
+                    }
+                }
+                let Some(node) = node else {
+                    self.reply.write_error("-ERR NODE option is required");
+                    return Ok(());
+                };
+                let result = self.server.cluster.assign_slots(slots, node).await;
+                match result {
+                    Ok(()) => self.reply.write_ok(),
+                    Err(e) => write!(self.reply, "-ERR failed to assign slots: {e:#}"),
+                }
+            }
+            [subcommand] if subcommand.eq_ignore_ascii_case(b"REBALANCE") => {
+                match self.server.cluster.rebalance_slots().await {
+                    Ok(()) => self.reply.write_ok(),
+                    Err(e) => write!(self.reply, "-ERR failed to rebalance slots: {e:#}"),
+                }
+            }
+            _ => return Err(CommandError::Syntax.into()),
         }
         Ok(())
     }

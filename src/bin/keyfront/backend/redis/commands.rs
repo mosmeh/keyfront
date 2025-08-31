@@ -227,7 +227,7 @@ impl Scan<'_> {
                 if cursor_in_slot != 0 {
                     continue;
                 }
-                match Slot::new(slot.get() + 1) {
+                match slot.next() {
                     Some(next_slot) => slot = next_slot,
                     None => {
                         // Scanning the last slot is done, so is the whole scan

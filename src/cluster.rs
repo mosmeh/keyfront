@@ -174,6 +174,14 @@ impl Slot {
     pub fn index(self) -> usize {
         usize::from(self.0)
     }
+
+    pub fn prev(self) -> Option<Self> {
+        self.0.checked_sub(1).and_then(Self::new)
+    }
+
+    pub fn next(self) -> Option<Self> {
+        (self.0 < Self::MAX).then(|| Self(self.0 + 1))
+    }
 }
 
 fn hash(key: &[u8]) -> Slot {
@@ -257,14 +265,14 @@ impl<T> SlotMap<T> {
         )
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Slot, &T)> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Slot, &T)> {
         self.0
             .iter()
             .enumerate()
             .map(|(i, x)| (Slot::new(i as u16).unwrap(), x))
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Slot, &mut T)> {
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (Slot, &mut T)> {
         self.0
             .iter_mut()
             .enumerate()
@@ -404,8 +412,7 @@ where
             }
             let next_range_start = node.as_ref().map(|x| (slot, x));
             if let Some((start, prev_node)) = self.range_start {
-                let prev_slot = Slot::new(slot.get() - 1).unwrap();
-                let next_value = (start, prev_slot, prev_node);
+                let next_value = (start, slot.prev().unwrap(), prev_node);
                 self.range_start = next_range_start;
                 return Some(next_value);
             }

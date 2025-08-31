@@ -13,9 +13,8 @@ use keyfront::{
 };
 use std::collections::HashSet;
 
-#[expect(dead_code)]
 #[derive(Debug, thiserror::Error)]
-enum ClusterError {
+pub enum ClusterError {
     #[error(transparent)]
     Command(#[from] CommandError),
 

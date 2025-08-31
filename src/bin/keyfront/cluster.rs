@@ -1,3 +1,4 @@
+mod assignment;
 mod state_machine;
 
 use crate::{
@@ -11,7 +12,7 @@ use etcd_client::{
 };
 use keyfront::cluster::{NodeName, Slot, SlotMap};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, RwLock, RwLockReadGuard},
     time::Duration,
@@ -176,6 +177,19 @@ impl Cluster {
         self.topology.read().unwrap()
     }
 
+    pub async fn assign_slots(&self, slots: HashSet<Slot>, node: NodeName) -> anyhow::Result<()> {
+        self.request(|response_tx| Request::AssignSlots {
+            slots,
+            node,
+            response_tx,
+        })
+        .await?
+    }
+
+    pub async fn rebalance_slots(&self) -> anyhow::Result<()> {
+        self.request(Request::RebalanceSlots).await?
+    }
+
     pub async fn resign_leader(&self) -> anyhow::Result<()> {
         self.request(Request::ResignLeader).await?
     }
@@ -242,6 +256,12 @@ async fn register_node(
 }
 
 enum Request {
+    AssignSlots {
+        slots: HashSet<Slot>,
+        node: NodeName,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RebalanceSlots(oneshot::Sender<anyhow::Result<()>>),
     ResignLeader(oneshot::Sender<anyhow::Result<()>>),
 }
 
