@@ -390,7 +390,7 @@ impl<B> Client<'_, B> {
             if node_name == cluster.this_node() {
                 return Ok(slot);
             }
-            let addr = *topology.node_addrs().get(node_name).unwrap();
+            let addr = topology.node(node_name).unwrap().addr();
             drop(topology);
             return Err(CommandError::Moved {
                 slot,

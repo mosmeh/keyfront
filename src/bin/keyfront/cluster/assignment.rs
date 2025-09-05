@@ -1,4 +1,4 @@
-use crate::cluster::Topology;
+use crate::cluster::{NodeRole, Topology};
 use keyfront::cluster::{NodeName, Slot};
 use std::{
     cmp::Ordering,
@@ -30,13 +30,8 @@ pub fn assign_unassigned_slots(topology: &Topology) -> HashMap<NodeName, HashSet
         }
     }
 
-    if topology.node_addrs().is_empty() {
-        return HashMap::new();
-    }
-
     let mut nodes: BTreeMap<&NodeName, Node> = topology
-        .node_addrs()
-        .keys()
+        .nodes_with_role(NodeRole::Data)
         .map(|name| {
             (
                 name,
@@ -48,6 +43,9 @@ pub fn assign_unassigned_slots(topology: &Topology) -> HashMap<NodeName, HashSet
             )
         })
         .collect();
+    if nodes.is_empty() {
+        return HashMap::new();
+    }
 
     let mut unassigned_slots: Vec<Slot> = Vec::new();
     for (slot, node_name) in topology.slots().iter() {
@@ -208,8 +206,7 @@ pub fn rebalance_slots(topology: &Topology) -> HashMap<NodeName, HashSet<Slot>> 
 
     let mut num_assigned_slots = 0;
     let mut node_slots: HashMap<&NodeName, Vec<Slot>> = topology
-        .node_addrs()
-        .keys()
+        .nodes_with_role(NodeRole::Data)
         .map(|name| (name, Vec::new()))
         .collect();
     for (slot, node) in topology.slots().iter() {

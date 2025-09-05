@@ -6,11 +6,13 @@ use crate::{
     cluster::state_machine::{NODE_BASE_PATH, StateMachine},
 };
 use anyhow::{Context, bail};
+use clap::ValueEnum;
 use etcd_client::{
     Certificate, Compare, CompareOp, ConnectOptions, Identity, LeaseKeepAliveStream, LeaseKeeper,
     PutOptions, TlsOptions, Txn, TxnOp, WatchOptions,
 };
 use keyfront::cluster::{NodeName, Slot, SlotMap};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr},
@@ -31,43 +33,51 @@ pub struct Cluster {
 
 impl Cluster {
     pub async fn connect(
-        config: &Config,
+        config: Config,
         addr_to_announce: Option<SocketAddr>,
         task_group: &TaskGroup,
         shutdown: &Shutdown,
     ) -> anyhow::Result<Self> {
         if config.meta.is_empty() {
-            let addr_to_announce = addr_to_announce.unwrap_or_else(|| {
+            let addr = addr_to_announce.unwrap_or_else(|| {
                 // This node is the only node in the cluster, so no one actually
                 // cares about this address. Just use a placeholder.
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
             });
-            Self::new_single_node(addr_to_announce)
+            let node = Node {
+                addr,
+                roles: config.roles,
+            };
+            Self::new_single_node(node)
         } else {
-            let addr_to_announce = addr_to_announce
+            let addr = addr_to_announce
                 .context("No TCP bind address specified, and no announce address provided")?;
-            Self::new_multi_node(config, addr_to_announce, task_group, shutdown).await
+            let this_node = Node {
+                addr,
+                roles: config.roles.clone(),
+            };
+            Self::new_multi_node(config, this_node, task_group, shutdown).await
         }
     }
 
-    fn new_single_node(addr_to_announce: SocketAddr) -> anyhow::Result<Self> {
+    fn new_single_node(node: Node) -> anyhow::Result<Self> {
         info!("Running as a single-node cluster");
-        let this_node =
+        let node_name =
             NodeName::generate_random().context("Failed to generate a random node name")?;
         let topology = Arc::new(RwLock::new(Topology {
-            node_addrs: HashMap::from([(this_node.clone(), addr_to_announce)]),
-            slots: SlotMap::filled(Some(this_node.clone())),
+            nodes: HashMap::from([(node_name.clone(), node)]),
+            slots: SlotMap::filled(Some(node_name.clone())),
         }));
         Ok(Self {
-            this_node,
+            this_node: node_name,
             topology,
             request_tx: None,
         })
     }
 
     async fn new_multi_node(
-        config: &Config,
-        addr_to_announce: SocketAddr,
+        config: Config,
+        this_node: Node,
         task_group: &TaskGroup,
         shutdown: &Shutdown,
     ) -> anyhow::Result<Self> {
@@ -132,12 +142,11 @@ impl Cluster {
             tokio::time::interval(config.etcd_lease_keep_alive_interval());
         lease_keep_alive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let this_node =
-            register_node(&mut etcd, root.clone(), addr_to_announce, lease.id()).await?;
-        info!("My node name is {this_node}");
+        let node_name = register_node(&mut etcd, root.clone(), &this_node, lease.id()).await?;
+        info!("My node name is {node_name}");
 
         let topology = Arc::new(RwLock::new(Topology {
-            node_addrs: HashMap::from([(this_node.clone(), addr_to_announce)]),
+            nodes: HashMap::from([(node_name.clone(), this_node)]),
             slots: SlotMap::default(),
         }));
 
@@ -147,9 +156,10 @@ impl Cluster {
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let state_machine = StateMachine {
+            config,
             etcd,
             root,
-            this_node: this_node.clone(),
+            this_node: node_name.clone(),
             topology: topology.clone(),
             lease,
             lease_keep_alive_interval,
@@ -163,7 +173,7 @@ impl Cluster {
         task_group.spawn(async move { state_machine.run().await });
 
         Ok(Self {
-            this_node,
+            this_node: node_name,
             topology,
             request_tx: Some(request_tx),
         })
@@ -211,14 +221,48 @@ impl Cluster {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node {
+    addr: SocketAddr,
+    roles: Vec<NodeRole>,
+}
+
+impl Node {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeRole {
+    /// Control plane.
+    /// Eligible to be elected as a leader, and manages cluster metadata.
+    Control,
+
+    /// Data plane. Serves client requests.
+    Data,
+}
+
 pub struct Topology {
-    node_addrs: HashMap<NodeName, SocketAddr>,
+    nodes: HashMap<NodeName, Node>,
     slots: SlotMap<Option<NodeName>>,
 }
 
 impl Topology {
-    pub fn node_addrs(&self) -> &HashMap<NodeName, SocketAddr> {
-        &self.node_addrs
+    pub fn node(&self, name: &NodeName) -> Option<&Node> {
+        self.nodes.get(name)
+    }
+
+    pub fn nodes(&self) -> &HashMap<NodeName, Node> {
+        &self.nodes
+    }
+
+    pub fn nodes_with_role(&self, role: NodeRole) -> impl Iterator<Item = &NodeName> {
+        self.nodes
+            .iter()
+            .filter_map(move |(name, node)| node.roles.contains(&role).then_some(name))
     }
 
     pub fn slot(&self, slot: Slot) -> Option<&NodeName> {
@@ -233,9 +277,10 @@ impl Topology {
 async fn register_node(
     client: &mut etcd_client::Client,
     root: Vec<u8>,
-    addr_to_announce: SocketAddr,
+    node: &Node,
     lease_id: i64,
 ) -> anyhow::Result<NodeName> {
+    let serialized = serde_json::to_string(node).context("Failed to serialize node metadata")?;
     loop {
         let name = NodeName::generate_random().context("Failed to generate a random node name")?;
         let mut key = root.clone();
@@ -245,7 +290,7 @@ async fn register_node(
             .when([Compare::create_revision(key.clone(), CompareOp::Equal, 0)])
             .and_then([TxnOp::put(
                 key,
-                addr_to_announce.to_string(),
+                serialized.clone(),
                 Some(PutOptions::new().with_lease(lease_id)),
             )]);
         if client.txn(txn).await?.succeeded() {

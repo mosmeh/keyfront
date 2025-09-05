@@ -1,6 +1,6 @@
 use crate::{
-    TaskGroup,
-    cluster::{Lease, Request, Topology, assignment},
+    Config, TaskGroup,
+    cluster::{Lease, Node, NodeRole, Request, Topology, assignment},
 };
 use anyhow::{Context, anyhow, bail, ensure};
 use bstr::ByteSlice;
@@ -12,7 +12,6 @@ use futures_util::{FutureExt, Stream, StreamExt};
 use keyfront::cluster::{NodeName, Slot};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    net::SocketAddr,
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Poll, ready},
@@ -35,6 +34,7 @@ enum State {
 }
 
 pub struct StateMachine {
+    pub config: Config,
     pub etcd: etcd_client::Client,
     pub root: Vec<u8>,
     pub this_node: NodeName,
@@ -105,12 +105,8 @@ impl StateMachine {
         &self,
         events: impl IntoIterator<Item = (EventType, &'a KeyValue)>,
     ) -> anyhow::Result<()> {
-        fn parse_node_addr(x: &[u8]) -> anyhow::Result<SocketAddr> {
-            str::from_utf8(x)?.parse().map_err(Into::into)
-        }
-
         let mut topology = self.topology.write().unwrap();
-        let Topology { node_addrs, slots } = &mut *topology;
+        let Topology { nodes, slots } = &mut *topology;
 
         for (event_type, kv) in events {
             let Some(key) = kv.key().strip_prefix(self.root.as_slice()) else {
@@ -123,26 +119,24 @@ impl StateMachine {
                 };
                 match event_type {
                     EventType::Put => {
-                        let new_addr = match parse_node_addr(kv.value()) {
-                            Ok(addr) => addr,
+                        let new_node: Node = match serde_json::from_slice(kv.value()) {
+                            Ok(node) => node,
                             Err(e) => {
-                                warn!("Invalid node address in key {}: {}", kv.key().as_bstr(), e);
+                                warn!("Failed to parse node metadata for {name}: {e}");
                                 continue;
                             }
                         };
-                        match node_addrs.entry(name.clone()) {
+                        match nodes.entry(name.clone()) {
                             Entry::Occupied(mut entry) => {
-                                let addr = entry.get_mut();
-                                if *addr != new_addr {
-                                    info!(
-                                        "Address of node {name} changed from {addr} to {new_addr}"
-                                    );
-                                    *addr = new_addr;
+                                let node = entry.get_mut();
+                                if *node != new_node {
+                                    info!("Node metadata for {name} updated: {new_node:?}");
+                                    *node = new_node;
                                 }
                             }
                             Entry::Vacant(entry) => {
-                                info!("Node {name} at {new_addr} joined the cluster");
-                                entry.insert(new_addr);
+                                info!("Node {} at {} joined the cluster", name, new_node.addr());
+                                entry.insert(new_node);
                             }
                         }
                     }
@@ -151,8 +145,8 @@ impl StateMachine {
                             name != self.this_node,
                             "This node was removed from the cluster"
                         );
-                        if node_addrs.remove(&name).is_some() {
-                            info!("Node {name} left the cluster");
+                        if let Some(node) = nodes.remove(&name) {
+                            info!("Node {} at {} left the cluster", name, node.addr());
                         }
                     }
                 }
@@ -166,7 +160,7 @@ impl StateMachine {
         // The leader will assign these slots to the remaining nodes.
         for (_, maybe_node) in slots.iter_mut() {
             if let Some(node) = maybe_node
-                && !node_addrs.contains_key(node)
+                && !nodes.contains_key(node)
             {
                 *maybe_node = None;
             }
@@ -296,7 +290,7 @@ impl Leader {
             let topology = ctx.topology.read().unwrap();
             let mut new_slots = topology.slots.clone();
             for (node, slots) in assignments {
-                if !topology.node_addrs.contains_key(node) {
+                if !topology.nodes.contains_key(node) {
                     return Err(anyhow!("Node {node} not found in cluster").into());
                 }
                 let mut changed_node = false;
@@ -445,7 +439,7 @@ impl Follower {
                     leader_path.clone(),
                     ctx.this_node.to_hex(),
                     ctx.lease.id(),
-                ), if self.leader_kv.is_none() => {
+                ), if ctx.config.roles.contains(&NodeRole::Control) && self.leader_kv.is_none() => {
                     let mut response = match result {
                         Ok(response) => response,
                         Err(e) => {

@@ -5,7 +5,7 @@ mod cluster;
 use crate::{
     backend::{Backend, MemoryBackend, RedisBackend},
     client::Client,
-    cluster::Cluster,
+    cluster::{Cluster, NodeRole},
 };
 use anyhow::ensure;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource};
@@ -132,6 +132,11 @@ config! {
     #[clap(default_value_t = defaults::ping_interval())]
     ping_interval: NonZeroU64,
 
+    /// The roles of this node in the cluster.
+    #[clap(default_values_t = defaults::roles(), value_delimiter = ',')]
+    #[arg(value_enum)]
+    roles: Vec<NodeRole>,
+
     /// IP address and port to announce to clients and other nodes in the cluster.
     ///
     /// Defaults to the first IP address and port in the `bind` list,
@@ -188,6 +193,7 @@ config! {
 }
 
 mod defaults {
+    use crate::cluster::NodeRole;
     use keyfront::{NonZeroMemorySize, net::Address};
     use std::{
         net::Ipv4Addr,
@@ -220,6 +226,10 @@ mod defaults {
 
     pub fn ping_interval() -> NonZeroU64 {
         NonZeroU64::new(1000).unwrap()
+    }
+
+    pub fn roles() -> Vec<NodeRole> {
+        vec![NodeRole::Control, NodeRole::Data]
     }
 
     pub fn meta_root() -> String {
@@ -257,6 +267,7 @@ impl Default for Config {
             backend: None,
             backend_timeout: defaults::backend_timeout(),
             ping_interval: defaults::ping_interval(),
+            roles: defaults::roles(),
             announce: None,
             meta: Vec::new(),
             meta_root: defaults::meta_root(),
@@ -476,7 +487,9 @@ async fn run_server(
     background_tasks: TaskGroup,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    if let Some(addr) = &config.backend {
+    if config.roles.contains(&NodeRole::Data)
+        && let Some(addr) = &config.backend
+    {
         info!("Initializing Redis backend");
         let backend =
             RedisBackend::connect(addr, &config, background_tasks.clone(), &shutdown).await?;
@@ -547,8 +560,13 @@ impl<B: Backend> Server<B> {
                 Address::Unix(_) => None,
             })
         });
-        let cluster =
-            Cluster::connect(&config, addr_to_announce, &background_tasks, &shutdown).await?;
+        let cluster = Cluster::connect(
+            config.clone(),
+            addr_to_announce,
+            &background_tasks,
+            &shutdown,
+        )
+        .await?;
 
         let mut listeners = Vec::with_capacity(sockets.len());
         for (socket, addr) in sockets.into_iter().zip(bound_addrs.iter()) {

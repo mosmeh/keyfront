@@ -69,7 +69,7 @@ impl<B: Backend> Client<'_, B> {
             nodes_with_slots.insert(node_name);
         }
         let slots_ok = slots_assigned;
-        let known_nodes = topology.node_addrs().len();
+        let known_nodes = topology.nodes().len();
         let size = nodes_with_slots.len();
         drop(topology);
 
@@ -100,9 +100,9 @@ impl<B: Backend> Client<'_, B> {
         let mut reply = Vec::new();
         {
             let topology = cluster.topology();
-            for (name, addr) in topology.node_addrs() {
+            for (name, node) in topology.nodes() {
                 reply.extend_from_slice(
-                    format!("{} {}:{}@0 ", name, addr.ip(), addr.port()).as_bytes(),
+                    format!("{} {}:{}@0 ", name, node.addr().ip(), node.addr().port()).as_bytes(),
                 );
                 if name == cluster.this_node() {
                     reply.extend_from_slice(b"myself,");
@@ -133,13 +133,13 @@ impl<B: Backend> Client<'_, B> {
         {
             let topology = self.server.cluster.topology();
             for (start, end, node_name) in topology.slots().assigned_ranges() {
-                let addr = topology.node_addrs().get(node_name).unwrap();
+                let node = topology.node(node_name).unwrap();
                 buf.write_array(3);
                 buf.write_integer(start.get());
                 buf.write_integer(end.get());
                 buf.write_array(4);
-                buf.write_bulk(addr.ip().to_string());
-                buf.write_integer(addr.port());
+                buf.write_bulk(node.addr().ip().to_string());
+                buf.write_integer(node.addr().port());
                 buf.write_bulk(node_name.to_hex());
                 buf.write_array(0);
                 num_items += 1;
