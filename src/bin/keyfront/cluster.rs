@@ -64,13 +64,12 @@ impl Cluster {
         info!("Running as a single-node cluster");
         let node_name =
             NodeName::generate_random().context("Failed to generate a random node name")?;
-        let topology = Arc::new(RwLock::new(Topology {
-            nodes: HashMap::from([(node_name.clone(), node)]),
-            slots: SlotMap::filled(Some(node_name.clone())),
-        }));
+        let mut topology = Topology::default();
+        topology.add_node(node_name.clone(), node);
+        topology.slots_mut().fill(Some(node_name.clone()));
         Ok(Self {
             this_node: node_name,
-            topology,
+            topology: Arc::new(RwLock::new(topology)),
             request_tx: None,
         })
     }
@@ -145,10 +144,9 @@ impl Cluster {
         let node_name = register_node(&mut etcd, root.clone(), &this_node, lease.id()).await?;
         info!("My node name is {node_name}");
 
-        let topology = Arc::new(RwLock::new(Topology {
-            nodes: HashMap::from([(node_name.clone(), this_node)]),
-            slots: SlotMap::default(),
-        }));
+        let mut topology = Topology::default();
+        topology.add_node(node_name.clone(), this_node);
+        let topology = Arc::new(RwLock::new(topology));
 
         let (_, watch_stream) = etcd
             .watch(root.clone(), Some(WatchOptions::new().with_prefix()))
@@ -245,9 +243,11 @@ pub enum NodeRole {
     Data,
 }
 
+#[derive(Default)]
 pub struct Topology {
     nodes: HashMap<NodeName, Node>,
     slots: SlotMap<Option<NodeName>>,
+    slot_reconfigurations: HashMap<NodeName, SlotState>,
 }
 
 impl Topology {
@@ -265,12 +265,21 @@ impl Topology {
             .filter_map(move |(name, node)| node.roles.contains(&role).then_some(name))
     }
 
+    pub fn add_node(&mut self, name: NodeName, node: Node) -> &mut Self {
+        self.nodes.insert(name, node);
+        self
+    }
+
     pub fn slot(&self, slot: Slot) -> Option<&NodeName> {
         self.slots[slot].as_ref()
     }
 
     pub fn slots(&self) -> &SlotMap<Option<NodeName>> {
         &self.slots
+    }
+
+    pub fn slots_mut(&mut self) -> &mut SlotMap<Option<NodeName>> {
+        &mut self.slots
     }
 }
 
@@ -355,4 +364,61 @@ impl Lease {
         self.alive_until = refreshed_at + Duration::from_secs(ttl);
         Ok(())
     }
+}
+
+// # Serialization format
+// Request:
+// {"id": "foo", "from": "caller", "to": "callee", "request": "Request", "data": {...}}
+// Success response:
+// {"id": "foo", "from": "callee", "to": "caller", "result": {...}}
+// Error response:
+// {"id": "foo", "from": "callee", "to": "caller", "error": {...}}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Rpc<T> {
+    id: String,
+    from: NodeName,
+    to: NodeName,
+    #[serde(flatten)]
+    message: T,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "request", content = "data")]
+enum RpcRequest {
+    Ping(Ping),
+    SetSlot(SetSlot),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RpcResponse<T, E> {
+    Result(T),
+    Error(E),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Ping {}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Pong {}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SetSlot {
+    slot: Slot,
+    node: SlotNode,
+    state: SlotState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SlotNode {
+    Unassigned,
+    Assigned(NodeName),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SlotState {
+    Stable,
+    LossyMigrating { to: NodeName },
+    Importing { from: NodeName },
 }

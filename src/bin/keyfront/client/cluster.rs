@@ -2,6 +2,7 @@ use crate::{
     backend::{Backend, BackendError},
     client::{Client, CommandError},
 };
+use bstr::ByteSlice;
 use bytes::BytesMut;
 use keyfront::{
     ByteBuf,
@@ -26,6 +27,9 @@ pub enum ClusterError {
 
     #[error("-ERR Slot {0} specified multiple times")]
     SlotSpecifiedMultipleTimes(u16),
+
+    #[error("-ERR Invalid node name: {}", .0.as_bstr())]
+    InvalidNodeName(ByteBuf),
 }
 
 impl From<BackendError> for ClusterError {
@@ -302,6 +306,12 @@ impl<B: Backend> Client<'_, B> {
             .dump_keys(slot, count, &mut self.reply)
             .await
             .map_err(Into::into)
+    }
+
+    pub(super) fn asking(&mut self) -> Result<(), CommandError> {
+        self.asking = true;
+        self.reply.write_ok();
+        Ok(())
     }
 
     pub(super) fn readonly(&mut self) -> Result<(), CommandError> {

@@ -77,6 +77,7 @@ fn generate_commands(out_dir: &Path) {
     writer
         .write_all(
             b"#[allow(dead_code)]
+        #[derive(PartialEq, Eq)]
         pub enum CommandId {",
         )
         .unwrap();
@@ -96,7 +97,7 @@ fn generate_commands(out_dir: &Path) {
         }
         writeln!(
             &mut writer,
-            "#[derive(Clone, Copy)]
+            "#[derive(Clone, Copy, PartialEq, Eq)]
             pub enum {}Command {{
                 Container,",
             name.to_identifier()

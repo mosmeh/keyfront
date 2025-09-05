@@ -80,12 +80,22 @@ impl<'de> Deserialize<'de> for NodeName {
 pub const CLUSTER_SLOT_MASK_BITS: usize = 14;
 pub const CLUSTER_SLOTS: usize = 1 << CLUSTER_SLOT_MASK_BITS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Slot(u16);
 
 impl std::fmt::Display for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for Slot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let slot: u16 = Deserialize::deserialize(deserializer)?;
+        Self::new(slot).ok_or_else(|| serde::de::Error::custom("slot out of range"))
     }
 }
 
@@ -263,6 +273,15 @@ impl<T> SlotMap<T> {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!()),
         )
+    }
+
+    pub fn fill(&mut self, value: T)
+    where
+        T: Clone,
+    {
+        for slot in 0..CLUSTER_SLOTS {
+            self.0[slot] = value.clone();
+        }
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Slot, &T)> {

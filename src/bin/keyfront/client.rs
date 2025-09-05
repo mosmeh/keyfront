@@ -53,6 +53,9 @@ pub enum CommandError {
     #[error("-MOVED {} {}", slot, addr.as_bstr())]
     Moved { slot: Slot, addr: ByteBuf },
 
+    #[error("-ASK {} {}", slot, addr.as_bstr())]
+    Ask { slot: Slot, addr: ByteBuf },
+
     #[error("-CLUSTERDOWN Hash slot not served")]
     HashSlotNotServed,
 
@@ -71,6 +74,7 @@ pub struct Client<'a, B> {
     id: u64,
     name: Option<ByteBuf>,
     reply: BytesMut,
+    asking: bool,
 }
 
 impl<'a, B: Backend> Client<'a, B> {
@@ -85,6 +89,7 @@ impl<'a, B: Backend> Client<'a, B> {
                 .fetch_add(1, atomic::Ordering::Relaxed),
             name: None,
             reply: BytesMut::new(),
+            asking: false,
         };
         pin! {
             let cancelled = server.client_tasks.cancelled();
@@ -126,6 +131,27 @@ impl<'a, B: Backend> Client<'a, B> {
         query: BytesMut,
         args: &mut [ByteBuf],
     ) -> Result<(), ConnectionError> {
+        let result = self.handle_query_impl(query, args).await;
+        let mut is_asking = false;
+        let result = match result {
+            Ok(Some(command)) if command.id == CommandId::Asking => {
+                is_asking = true;
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if !is_asking {
+            self.asking = false;
+        }
+        result
+    }
+
+    async fn handle_query_impl(
+        &mut self,
+        query: BytesMut,
+        args: &mut [ByteBuf],
+    ) -> Result<Option<&Command>, ConnectionError> {
         fn append_args_to_error(args: &[ByteBuf], out: &mut Vec<u8>) {
             out.extend_from_slice(b"', with args beginning with: ");
             for arg in args {
@@ -139,7 +165,7 @@ impl<'a, B: Backend> Client<'a, B> {
         }
 
         let [command_name, args @ ..] = args else {
-            return Ok(());
+            return Ok(None);
         };
         let command_name = CommandName::new(command_name);
         let Some(command) = COMMANDS.get(&command_name) else {
@@ -147,7 +173,7 @@ impl<'a, B: Backend> Client<'a, B> {
             err.extend_from_slice(command_name.truncated(128).as_bytes());
             append_args_to_error(args, &mut err);
             self.reply.write_error(err);
-            return Ok(());
+            return Ok(None);
         };
 
         let (command, args) = match args {
@@ -160,7 +186,7 @@ impl<'a, B: Backend> Client<'a, B> {
                     err.extend_from_slice(command.full_name.to_ascii_uppercase().as_bytes());
                     err.extend_from_slice(b" HELP.");
                     self.reply.write_error(err);
-                    return Ok(());
+                    return Ok(None);
                 };
                 (subcommand, args)
             }
@@ -169,7 +195,7 @@ impl<'a, B: Backend> Client<'a, B> {
 
         let result = self.try_handle_command(query, command, args).await;
         match result {
-            Ok(()) => {}
+            Ok(()) => return Ok(Some(command)),
             Err(CommandError::Connection(e)) => return Err(e),
             Err(CommandError::Unimplemented) => {
                 let mut err = b"-ERR unimplemented command or option: command '".to_vec();
@@ -184,7 +210,7 @@ impl<'a, B: Backend> Client<'a, B> {
             ),
             Err(e) => self.reply.write_error(e.to_string()),
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn try_handle_command(
@@ -210,6 +236,7 @@ impl<'a, B: Backend> Client<'a, B> {
             CommandId::Select => self.select(args),
             CommandId::Client(c) => self.client(c, args),
             CommandId::Cluster(c) => self.cluster(c, args).await,
+            CommandId::Asking => self.asking(),
             CommandId::Readonly => self.readonly(),
             CommandId::Readwrite => self.readwrite(),
             CommandId::Move => self.r#move(),
@@ -288,6 +315,7 @@ impl<'a, B: Backend> Client<'a, B> {
     }
 
     async fn keyfront_slot(&mut self, args: &[ByteBuf]) -> Result<(), ClusterError> {
+        let cluster = &self.server.cluster;
         match args {
             [subcommand, opts @ ..] if subcommand.eq_ignore_ascii_case(b"ASSIGN") => {
                 let mut node = None;
@@ -321,14 +349,8 @@ impl<'a, B: Backend> Client<'a, B> {
                         [opt, node_name, rest @ ..]
                             if opt.eq_ignore_ascii_case(b"NODE") && node.is_none() =>
                         {
-                            let Some(node_name) = NodeName::from_hex(node_name.as_ref()) else {
-                                write!(
-                                    self.reply,
-                                    "-ERR Invalid node name: {}",
-                                    node_name.as_bstr()
-                                );
-                                return Ok(());
-                            };
+                            let node_name = NodeName::from_hex(node_name.as_ref())
+                                .ok_or_else(|| ClusterError::InvalidNodeName(node_name.clone()))?;
                             node = Some(node_name);
                             opts = rest;
                         }
@@ -339,17 +361,21 @@ impl<'a, B: Backend> Client<'a, B> {
                     self.reply.write_error("-ERR NODE option is required");
                     return Ok(());
                 };
-                let result = self.server.cluster.assign_slots(slots, node).await;
+                let result = cluster.assign_slots(slots, node).await;
                 match result {
                     Ok(()) => self.reply.write_ok(),
                     Err(e) => write!(self.reply, "-ERR failed to assign slots: {e:#}"),
                 }
             }
             [subcommand] if subcommand.eq_ignore_ascii_case(b"REBALANCE") => {
-                match self.server.cluster.rebalance_slots().await {
+                match cluster.rebalance_slots().await {
                     Ok(()) => self.reply.write_ok(),
                     Err(e) => write!(self.reply, "-ERR failed to rebalance slots: {e:#}"),
                 }
+            }
+            [subcommand] if subcommand.eq_ignore_ascii_case(b"RPC") => {
+                // Transition the connection to RPC mode.
+                todo!()
             }
             _ => return Err(CommandError::Syntax.into()),
         }
@@ -388,7 +414,12 @@ impl<B> Client<'_, B> {
         let topology = cluster.topology();
         if let Some(node_name) = topology.slot(slot) {
             if node_name == cluster.this_node() {
+                // TODO: Respond with ASK if the slot is migrating.
                 return Ok(slot);
+            }
+            if self.asking {
+                // TODO: Accept the command if the slot is importing.
+                todo!()
             }
             let addr = topology.node(node_name).unwrap().addr();
             drop(topology);

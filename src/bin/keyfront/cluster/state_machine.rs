@@ -106,7 +106,7 @@ impl StateMachine {
         events: impl IntoIterator<Item = (EventType, &'a KeyValue)>,
     ) -> anyhow::Result<()> {
         let mut topology = self.topology.write().unwrap();
-        let Topology { nodes, slots } = &mut *topology;
+        let Topology { nodes, slots, .. } = &mut *topology;
 
         for (event_type, kv) in events {
             let Some(key) = kv.key().strip_prefix(self.root.as_slice()) else {
