@@ -107,7 +107,7 @@ impl Drop for Repr {
     fn drop(&mut self) {
         if matches!(self.tag, Tag::Heap) {
             let _ = unsafe {
-                Box::from_raw(std::slice::from_raw_parts_mut(
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                     self.heap_ptr,
                     self.heap_len(),
                 ))
